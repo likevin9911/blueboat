@@ -1,26 +1,20 @@
-# ROS Autonomy Simulation
+# BlueBoat Marine Navigation Stack
 
-## Clone
+ROS Noetic navigation stack for [Clearpath BlueBoat](https://clearpathrobotics.com/blueboat/) with marine-tuned SLAM, localization, and dynamic obstacle avoidance.
 
+![BlueBoat avoiding buoys](docs/demo.jpg)  <!-- Optional: add screenshot later -->
 
+## ✅ Features
+- **Gmapping SLAM** with pointcloud-to-laserscan conversion (marine lidar tuned)
+- **AMCL localization** against static harbor maps
+- **Dynamic obstacle avoidance** for buoys/vessels (marine-tuned 12m×12m local costmap)
+- **VRX-compatible** sensor configuration (buoyancy plugins, wave-aware planning)
+- GPS/IMU fusion via `robot_localization` (dual EKF architecture)
+
+## 🚀 Quick Start
+
+### Build
 ```bash
-cd ~/catkin_ws/src
-```
-```bash
-git clone https://github.com/SinLoops333/4WD_description.git
-cd ~/catkin_ws 
-```
-
-```bash
-catkin build 
-```
-
-```bash
-source ./devel/setup.bash
-source ~/.bashrc 
-```
-
-## Launch Rviz and Gazebo
-```bash
-roslaunch 4WD_description gazebo.launch 
-```
+cd ~/blueboat_ws
+catkin_make
+source devel/setup.bash
