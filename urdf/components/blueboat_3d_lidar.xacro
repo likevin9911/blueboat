@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+  <!-- Macro to insert a 3D scanning LIDAR with ROS integration
+    name: Prefix used for naming.
+    x: X position of the laser (from the base_link).
+    y: Y position of the laser (from the base_link).
+    z: Z position of the laser (from the base_link).
+    R: Roll orientation of the laser (from the laser's origin).
+    P: Pitch orientation of the laser (from the laser's origin).
+    Y: Yaw orientation of the laser (from the laser's origin).
+    post_Y: Yaw orientation of the post (from the post's origin).
+    post_z_from: Z position of the post's base.
+    update_rate: frequency to publish output, hz
+    vertical_lasers: number of vertical lasers which spin about Z to generate output
+    samples: number of samples during spin, higher is more dense but slows down simulation
+    resolution: This number is multiplied by samples to determine the number of range data points returned.
+    min_angle: the horizontal angle that the scan begins at
+    max_angle: the angle that the scan ends at
+    min_vertical_angle: the angle of the lowest vertical beam
+    max_vertical_angle: the angle of the highest vertical beam
+    max_range: maximum distance for an object to be detected by laser
+    noise_stddev: Standard deviation of gaussian noise applied to output pointcloud
+  -->
+  <xacro:macro name="blueboat_3d_lidar" params="name
+                                            x:=0.7 y:=0 z:=1.8
+                                            R:=0 P:=0 Y:=0
+                                            update_rate:=10 vertical_lasers:=16 samples:=1875 resolution:=0.1
+                                            min_angle:=${-pi} max_angle:=${pi}
+                                            min_vertical_angle:=${-pi/12} max_vertical_angle:=${pi/12}
+                                            max_range:=130 noise_stddev:=0.01">
+    <!-- 3d lidar sensor -->
+    <link name="${namespace}/${name}_link">
+      <visual name="${name}_visual">
+        <origin xyz="0 0 -0.035" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="package://blueboat/meshes/sensors/3d_lidar/mesh/3d_lidar.dae"/>
+        </geometry>
+      </visual>
+      <collision name="${name}_collision">
+        <geometry>
+          <cylinder radius="0.055" length="0.075"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <mass value="1"/>
+        <inertia
+          ixx="0.00109375"
+          iyy="0.00109375"
+          izz="0.00125"
+          ixy="0"
+          ixz="0"
+          iyz="0"/>
+      </inertial>
+    </link>
+
+
+    <!-- Sensor post arm to lidar joint -->
+    <joint name="${namespace}/${name}_to_${name}_joint" type="fixed">
+      <origin xyz="${x} ${y} ${z}" rpy="${R} ${P} ${Y}"/>
+      <parent link="${namespace}/base_link" />
+      <child link="${namespace}/${name}_link" />
+    </joint>
+
+    <gazebo reference="${namespace}/${name}_link">
+      <sensor type="gpu_ray" name="${name}_sensor">
+        <update_rate>${update_rate}</update_rate>
+        <ray>
+          <scan>
+            <horizontal>
+              <samples>${samples/resolution}</samples>
+              <resolution>${resolution}</resolution>
+              <min_angle>${min_angle}</min_angle>
+              <max_angle>${max_angle}</max_angle>
+            </horizontal>
+            <vertical>
+              <samples>${vertical_lasers}</samples>
+              <resolution>1</resolution>
+              <min_angle>${min_vertical_angle}</min_angle>
+              <max_angle>${max_vertical_angle}</max_angle>
+            </vertical>
+          </scan>
+          <range>
+            <min>0.1</min>
+            <max>${max_range}</max>
+          </range>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>${noise_stddev}</stddev>
+          </noise>
+        </ray>
+        <plugin name="${name}_plugin" filename="libgazebo_ros_velodyne_gpu_laser.so">
+          <topicName>${namespace}/${sensor_namespace}lidars/${name}/points</topicName>
+          <frameName>${namespace}/${name}_link</frameName>
+          <min_intensity>0</min_intensity>
+        </plugin>
+      </sensor>
+    </gazebo>
+
+  </xacro:macro>
+</robot>

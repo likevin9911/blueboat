@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<plugin xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="blueboat_gazebo_thruster_config" params="name enable_angle:=true">
+  <thruster>
+      <!-- Required Parameters -->
+      <linkName>${namespace}/${name}_propeller_link</linkName>
+      <propJointName>${namespace}/${name}_propeller_joint</propJointName>
+      <engineJointName>${namespace}/${name}_thruster_joint</engineJointName>
+      <cmdTopic>${thruster_namespace}${name}_thrust_cmd</cmdTopic>
+      <angleTopic>${thruster_namespace}${name}_thrust_angle</angleTopic>
+      <enableAngle>${enable_angle}</enableAngle>
+
+      <!-- Optional Parameters -->
+      <mappingType>1</mappingType>
+      <maxCmd>1.0</maxCmd>
+      <maxForceFwd>50.0</maxForceFwd>
+      <maxForceRev>-30.0</maxForceRev>
+      <maxAngle>${pi/2}</maxAngle>
+    </thruster>
+  </xacro:macro>
+</plugin>

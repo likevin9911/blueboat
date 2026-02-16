@@ -1,0 +1,352 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="blueboat" xmlns:xacro="http://ros.org/wiki/xacro">
+
+	<!-- Init colour -->
+	<material name="black">
+	    <color rgba="0.0 0.0 0.0 1.0"/>
+	</material>
+
+	<material name="dark">
+	  <color rgba="0.3 0.3 0.3 1.0"/>
+	</material>
+
+	<material name="light_black">
+	  <color rgba="0.4 0.4 0.4 1.0"/>
+	</material>
+
+	<material name="blue">
+	  <color rgba="0.0 0.0 0.8 1.0"/>
+	</material>
+
+	<material name="green">
+	  <color rgba="0.0 0.8 0.0 1.0"/>
+	</material>
+
+	<material name="grey">
+	  <color rgba="0.5 0.5 0.5 1.0"/>
+	</material>
+
+	<material name="orange">
+	  <color rgba="1.0 0.4235 0.0392 1.0"/>
+	</material>
+
+	<material name="brown">
+	  <color rgba="0.8706 0.8118 0.7647 1.0"/>
+	</material>
+
+	<material name="red">
+	  <color rgba="0.8 0.0 0.0 1.0"/>
+	</material>
+
+	<material name="white">
+	  <color rgba="1.0 1.0 1.0 1.0"/>
+	</material>
+
+	<material name="yellow">
+	  <color rgba="1.0 1.0 0.0 1.0"/>
+	</material>
+
+
+
+    <link name="base_footprint"/>
+
+    <joint name="base_joint" type="fixed">
+	    <parent link="base_footprint"/>
+	    <child link="base_link" />
+	    <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
+	
+	<link name="base_link">
+	    <visual>
+	      <origin xyz="-0.6 -0.6 -0.25" rpy="1.57 0 1.57"/>
+	      <geometry>
+	        <mesh filename="package://blueboat/meshes/base/blueboat.stl" scale="0.001 0.001 0.001"/>
+	      </geometry>
+	      <material name="blue"/>
+	    </visual>
+
+	    <collision>
+	      <origin xyz="-0.064 0 0.047" rpy="1.57 0 1.57"/>
+	      <geometry>
+	        <box size="0.266 0.266 0.094"/>
+	      </geometry>
+	    </collision>
+
+	    <inertial>
+	      <origin xyz="0 0 0" rpy="0 0 0"/>
+	      <mass value="1.3729096e+00"/>
+	      <inertia ixx="8.7002718e-03" ixy="-4.7576583e-05" ixz="1.1160499e-04"
+	               iyy="8.6195418e-03" iyz="-3.5422299e-06"
+	               izz="1.4612727e-02" />
+	    </inertial>
+    </link>
+
+    <!-- ==LiDAR Velodyne Puck== -->
+    <link name="lidar_link">
+	    
+	    <visual>
+	    	<origin rpy="0 0 0" xyz="0 0 0"/>
+	        <geometry>
+	          <mesh filename="package://blueboat/meshes/sensors/3d_lidar/mesh/3d_lidar.dae"/>
+	        </geometry>
+	    </visual>
+
+	    <collision>
+	      <geometry>
+	        <cylinder length="0.075" radius="0.055"/>
+	      </geometry>
+	    </collision>
+	    
+	    <inertial>
+	      <mass value="1"/>
+	      <inertia ixx="0.00109375" ixy="0" ixz="0" iyy="0.00109375" iyz="0" izz="0.00125"/>
+	    </inertial>
+    </link>
+    <joint name="lidar_joint" type="fixed">
+	    <origin rpy="0.0 0 0.0" xyz="0.305 0 0.13"/>
+	    <parent link="base_link"/>
+	    <child link="lidar_link"/>
+    </joint>
+
+    <!-- ==IMU Link== -->
+    <link name="imu_link">
+	    <visual name="imu_visual">
+	    	<origin rpy="0 0 0" xyz="0 0 0"/>
+	        <geometry>
+	          <box size="0.05 0.025 0.005"/>
+	        </geometry>
+	        <material name="white"/>
+	    </visual>
+	    <inertial>
+	        <mass value="0.1"/>
+	        <inertia ixx="0.000083" ixy="0.0" ixz="0.0" iyy="0.000083" iyz="0.0" izz="0.0125"/>
+	    </inertial>
+    </link>
+    <joint name="imu_joint" type="fixed">
+	    <origin rpy="0.0 0.0 0.0" xyz="0.305 0.0 0.2"/>
+	    <parent link="base_link"/>
+	    <child link="imu_link"/>
+    </joint>
+
+    <!-- ==GPS Link== -->
+    <link name="rtk_gps_link">
+	    <visual name="rtk_gps_visual">
+	        <geometry>
+	          <mesh filename="package://blueboat/meshes/sensors/gps/mesh/gps.dae" scale="0.25 0.25 0.25"/>
+	        </geometry>
+	    </visual>
+
+	    <collision name="rtk_gps_collision_base">
+	        <origin rpy="0 0 0" xyz="0 0 0.025"/>
+	        <geometry>
+	          <cylinder length="0.025" radius="0.0075"/>
+	        </geometry>
+	    </collision>
+	    
+	    <collision name="rtk_gps_collision_antenna">
+	        <origin rpy="0 0 0" xyz="0 0 0.03"/>
+	        <geometry>
+	          <cylinder length="0.04" radius="0.05"/>
+	        </geometry>
+	    </collision>
+	    
+	    <inertial>
+	        <mass value="1"/>
+	        <inertia ixx="0.006458" ixy="0.0" ixz="0.0" iyy="0.006458" iyz="0.0" izz="0.01125"/>
+	    </inertial>
+   </link>
+   <joint name="rtk_gps_joint" type="fixed">
+	   <axis xyz="0 0 1"/>
+	   <origin rpy="0.0 0.0 0.0" xyz="0.0 0.35 0.145"/>
+	   <parent link="base_link"/>
+	   <child link="rtk_gps_link"/>
+	</joint>
+
+	<!-- == Camera Link == -->
+	<link name="camera_link">
+	    <visual name="camera_visual">
+	        <origin rpy="0 0 0" xyz="0 0 0"/>
+	        <geometry>
+	          <mesh filename="package://blueboat/meshes/sensors/d435i_camera.stl" scale="0.01 0.01 0.01"/>
+	        </geometry>
+	    </visual>
+
+	    <collision name="camera_box_collision">
+	      <origin rpy="0 0 0" xyz="-0.0205 0 0"/>
+	        <geometry>
+	          <box size="0.036 0.03 0.03"/>
+	        </geometry>
+	    </collision>
+	  
+	    <inertial>
+	        <mass value="0.3"/>
+	        <inertia ixx="0.0000450" ixy="0" ixz="0" iyy="0.0001746" iyz="0" izz="0.0001746"/>
+	    </inertial>
+    </link>
+    <joint name="base_to_camera_joint" type="fixed">
+	    <origin rpy="0 0 0.0" xyz="0.31 0.0 0.105"/>
+	    <parent link="base_link"/>
+	    <child link="camera_link"/>
+    </joint>
+
+    <!-- == Sonar Link == -->
+    <link name="sonar_link">
+	    <visual name="rtk_gps_visual">
+	        <geometry>
+	          <mesh filename="package://blueboat/meshes/sensors/ping360.stl" scale="0.005 0.005 0.005"/>
+	        </geometry>
+	    </visual>
+
+	    <inertial>
+	        <mass value="0.1"/>
+	        <inertia ixx="0.000083" ixy="0.0" ixz="0.0" iyy="0.000083" iyz="0.0" izz="0.0125"/>
+	    </inertial>
+    </link>
+    <joint name="base_to_sonar_joint" type="fixed">
+	    <origin rpy="0 0 0.0" xyz="-0.29 -0.29 -0.2"/>
+	    <parent link="base_link"/>
+	    <child link="sonar_link"/>
+    </joint> 
+
+    <!-- == Thruster Link == -->
+    <link name="left_thruster_link">
+    	<visual>
+    	<origin xyz="0 0 0" rpy="0 -1.57 0"/>
+    	<geometry>
+    		<cylinder length="0.04" radius="0.02"/>
+    	</geometry>
+    	<material name="black"/>
+  		</visual>
+	</link>
+    <joint name="base_to_left_thruster" type="fixed">
+		<axis rpy="0 0 0"/>
+	    <parent link="base_link"/>
+	    <child link="left_thruster_link"/>
+	    <origin rpy="0 0 0" xyz="-0.48 -0.3 -0.145"/>
+    </joint>
+
+    <link name="left_propeller_link">
+	    <visual>
+	        <origin xyz="-0.05 -0.1 -0.09" rpy="0 0 0"/>
+	        <geometry>
+	          <mesh filename="package://blueboat/meshes/thrusters/left.stl" scale="0.001 0.001 0.001"/>
+	        </geometry>
+	        <material name="yellow"/>
+	    </visual>
+
+	    <collision>
+	        <origin xyz="0 0 0" rpy="0 0 0"/>
+	        <geometry>
+	          <cylinder length="0.018" radius="0.033"/>
+	        </geometry>
+	    </collision>
+
+	    <inertial>
+	        <origin xyz="0 0 0" />
+	        <mass value="2.8498940e-02" />
+	        <inertia ixx="1.1175580e-05" ixy="-4.2369783e-11" ixz="-5.9381719e-09"
+	                 iyy="1.1192413e-05" iyz="-1.4400107e-11"
+	                 izz="2.0712558e-05" />
+	    </inertial>
+    </link>
+    <joint name="thruster_left_joint" type="continuous">
+	    <parent link="left_thruster_link"/>
+	    <child link="left_propeller_link"/>
+	    <origin rpy="0 0 -1.57" xyz="0 0 0"/>
+	    <axis   xyz="1 0 0"/> 
+	    <limit effort="100" velocity="100"/>
+	    <dynamics damping="0.05" friction="0.05"/>
+    </joint>
+    
+
+    <link name="right_thruster_link"/>
+    <joint name="base_to_right_thruster" type="fixed">
+		<axis rpy="0 0 0" />
+	    <parent link="base_link"/>
+	    <child link="right_thruster_link"/>
+	    <origin rpy="0 0 0" xyz="-0.48 0.3 -0.145"/>
+    </joint>
+
+    <link name="right_propeller_link">
+	    <visual>
+	      <origin xyz="0.05 0.07 -0.1" rpy="1.57 0 0"/>
+	      <geometry>
+	        <mesh filename="package://blueboat/meshes/thrusters/right.stl" scale="0.001 0.001 0.001"/>
+	      </geometry>
+	      <material name="yellow"/>
+	    </visual>
+
+	    <collision>
+	      <origin xyz="0 0 0" rpy="0 0 0"/>
+	      <geometry>
+	        <cylinder length="0.018" radius="0.033"/>
+	      </geometry>
+	    </collision>
+
+	    <inertial>
+	      <origin xyz="0 0 0" />
+	      <mass value="2.8498940e-02" />
+	      <inertia ixx="1.1175580e-05" ixy="-4.2369783e-11" ixz="-5.9381719e-09"
+	               iyy="1.1192413e-05" iyz="-1.4400107e-11"
+	               izz="2.0712558e-05" />
+         </inertial>
+    </link>
+    <joint name="thruster_right_joint" type="continuous">
+		<axis xyz="1 0 0"/>
+	    <parent link="right_thruster_link"/>
+	    <child link="right_propeller_link"/>
+	    <origin rpy="0 1.57 0" xyz="0 0 0"/>
+	    <limit effort="100" velocity="100"/>
+	    <dynamics damping="0.05" friction="0.05"/>
+    </joint>
+
+
+
+    <!-- ==plugins== -->
+    <gazebo>
+	    <plugin name="p3d_plugin" filename="libgazebo_ros_p3d.so">
+	      <bodyName>base_link</bodyName>
+	      <frameName>map</frameName>
+	      <updateRate>15.0</updateRate>  
+	      <topicName>ground_truth</topicName>
+	      <xyzOffset>0 0 0</xyzOffset>
+	      <rpyOffset>0 0 0</rpyOffset>
+	      <gaussianNoise>0.2</gaussianNoise>
+	    </plugin>
+    </gazebo>
+
+    <gazebo reference="lidar_wamv_link">
+	    <sensor name="lidar_wamv_sensor" type="gpu_ray">
+	      <update_rate>15</update_rate>
+	      <ray>
+	        <scan>
+	          <horizontal>
+	            <samples>20000.0</samples>
+	            <resolution>0.018</resolution>
+	            <min_angle>-3.141592653589793</min_angle>
+	            <max_angle>3.141592653589793</max_angle>
+	          </horizontal>
+	          <vertical>
+	            <samples>32</samples>
+	            <resolution>1.875</resolution>
+	            <min_angle>-0.2617993877991494</min_angle>
+	            <max_angle>0.2617993877991494</max_angle>
+	          </vertical>
+	        </scan>
+	        <range>
+	          <min>0.1</min>
+	          <max>130</max>
+	        </range>
+	        <noise>
+	          <type>gaussian</type>
+	          <mean>0.0</mean>
+	          <stddev>0.0</stddev>
+	        </noise>
+	      </ray>
+	    </sensor>
+    </gazebo>
+</robot>
+
+
+
+  

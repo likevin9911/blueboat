@@ -1,0 +1,13 @@
+navsat_transform:
+  frequency: 60
+  delay: 0.2
+  magnetic_declination_radians: 0.0
+  yaw_offset: 0.0
+  zero_altitude: true
+  broadcast_utm_transform: true
+  publish_filtered_gps: true
+  use_odometry_yaw: true
+  wait_for_datum: true
+  datum: [-33.73, 150.67]  
+  two_d_mode: false
+

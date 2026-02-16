@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:include filename="$(find blueboat)/urdf/macros.xacro" />
+  <xacro:macro  name="blueboat" params="thruster_layout">
+    <xacro:include filename="$(find blueboat)/urdf/blueboat_base.urdf.xacro" />
+    <xacro:include filename="${thruster_layout}"/>
+    <!-- Attach hydrodynamics plugin -->
+    <xacro:usv_dynamics_gazebo name="blueboat_dynamics_plugin"/>
+  </xacro:macro>
+</robot>
+
+

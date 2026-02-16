@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="blueboat">
+  <xacro:macro name="engine" params="prefix position:='0 0 0' orientation:='0 0 0'">
+    <link name="${namespace}/${prefix}_thruster_link">
+      <!--visual>
+        <origin xyz="0.0 0 0" rpy="0 -1.57 0"/>
+        <geometry>
+          <cylinder length="0.02" radius="0.02"/>
+        </geometry>
+      </visual-->
+      <inertial>
+        <mass value="0.3"/>
+        <inertia ixx="6.0e-05" ixy="0" ixz="0" iyy="7.0e-05" iyz="0" izz="7.0e-05"/>
+      </inertial>
+    </link>
+    
+    <link name="${namespace}/${prefix}_propeller_link">
+      <visual>
+        <origin xyz="-0.09 0.045 -0.08" rpy="0 0 -1.57"/>
+        <geometry>
+          <mesh filename="package://blueboat/meshes/thrusters/${prefix}.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+      </visual>
+      <!--collision>
+        <origin xyz="0 0 0" rpy="0 -1.57 0"/>
+        <geometry>
+          <cylinder length="0.1" radius="0.08"/> 
+        </geometry>
+      </collision-->
+      <inertial>
+        <mass value="0.05"/>
+        <inertia ixx="6.0e-05" ixy="0" ixz="0" iyy="7.0e-05" iyz="0" izz="7.0e-05"/>
+      </inertial>
+    </link>
+
+    <joint name="${namespace}/${prefix}_thruster_joint" type="revolute">
+      <axis xyz="0 0 1"/>
+      <limit lower="${-pi}" upper="${pi}" effort="10" velocity="10"/>
+      <origin xyz="${position}" rpy="${orientation}"/>
+      <parent link="${namespace}/base_link"/>
+      <child  link="${namespace}/${prefix}_thruster_link"/>
+      <dynamics damping="0.05" friction="0.05"/>
+    </joint>
+    
+    <joint name="${namespace}/${prefix}_propeller_joint" type="continuous">
+      <axis xyz="1 0 0"/>
+      <parent link="${namespace}/${prefix}_thruster_link"/>
+      <child  link="${namespace}/${prefix}_propeller_link"/>
+      <origin xyz="-0.02 0 0" rpy="0 0 0"/>
+      <limit effort="100" velocity="100"/>
+      <dynamics friction="0.05" damping="0.05"/>
+    </joint>
+  </xacro:macro>
+</robot>
+

@@ -1,0 +1,9 @@
+
+maxUrange: 30.0
+
+
+base_frame:  "base_link"
+odom_frame:  "odom0"
+map_frame:  "map"
+scan:  "scan" 
+

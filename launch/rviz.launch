@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<launch>
+
+  <arg name="rviz_config" default="$(find blueboat)/rviz/launch.rviz" />
+    <node
+      pkg="rviz" type="rviz" name="blueboat_viz" args="-d $(arg rviz_config)" output="screen"/>
+
+</launch>

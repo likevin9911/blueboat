@@ -1,0 +1,37 @@
+# ROS build artifacts
+build/
+devel/
+install/
+*.log
+*.swp
+*~
+
+# VRX simulation artifacts
+*.sdf
+*.world
+*.dae
+*.png
+*.jpg
+
+# Binary blobs (DO NOT commit)
+*.bag
+*.bag.active
+*.zip
+*.pcd
+
+# Folders 
+ros_env/
+scripts/
+move_base_params.zip
+src/
+launch/old/
+param/old/
+meshes/base/blueboat.stl
+
+# Editor cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+EOF
+

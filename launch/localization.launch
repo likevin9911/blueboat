@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<launch>
+  <rosparam param="silent_tf_failure">true</rosparam>
+  <rosparam command="load" file="$(find blueboat)/param/ekf_params.yaml" />
+  <rosparam command="load" file="$(find blueboat)/param/navsat_params.yaml" />
+  
+  <node pkg="robot_localization" type="ekf_localization_node" name="ekf_se_odom" clear_params="false">
+    <remap from="odometry/filtered" to="blueboat/robot_localization/odometry/filtered_odom"/>
+  </node>
+
+  <node pkg="robot_localization" type="ekf_localization_node" name="ekf_se_map" clear_params="false">
+    <remap from="odometry/filtered" to="blueboat/robot_localization/odometry/filtered_map"/>
+  </node>
+
+  <node pkg="robot_localization" type="navsat_transform_node" name="navsat_transform" clear_params="false" output="screen">
+      <remap from="odometry/filtered" to="odometry/filtered_odom"/>
+      <remap from="odometry/gps" to="/blueboat/robot_localization/odometry/gps"/>
+
+      <remap from="gps/fix" to="/blueboat/sensors/gps/gps/fix"/>
+      <remap from="imu/data" to="/blueboat/sensors/imu/imu/data"/>
+  </node>
+
+</launch>
