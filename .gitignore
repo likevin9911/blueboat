@@ -1,0 +1,36 @@
+build/
+devel/
+install/
+logs/
+.catkin_tools/
+.catkin_workspace
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+__pycache__/
+*.pyc
+*.csv
+*.pdf
+*.gv
+*.pbstream
+
+# data/experiment artifacts you had in src/
+src/*.csv
+src/*.png
+src/goto_performance.png
+src/metrics_summary.csv
+src/LISA/
+src/obsdet_msgs/
+src/vrx_gazebo/
+src/usv_gazebo_plugins/
+src/wave_gazebo/
+src/wave_gazebo_plugins/
+
+# bagfiles and other large binary artifacts
+*.bag
+*.bag.active
+# vendored python/conda environment
+src/ros_env/
+src/blueboat_description/meshes/base/blueboat.stl

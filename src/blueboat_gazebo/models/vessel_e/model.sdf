@@ -1,0 +1,69 @@
+<?xml version='1.0' ?>
+<sdf version="1.6">
+  <model name="vessel_a">
+    <static>false</static>
+    <link name="link">
+      <enable_wind>true</enable_wind>
+      <inertial>
+      <mass>20</mass>
+        <!-- Mark only - based on cylinder -->
+        <inertia>
+          <ixx>1.0</ixx>
+          <ixy>0</ixy>
+          <ixz>0</ixz>
+          <iyy>1.0</iyy>
+          <iyz>0</iyz>
+          <izz>0.1</izz>
+        </inertia>
+        </inertial>
+      <visual name="visual">
+        <pose>0 0 0 0 0 -1.5708</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/Boat05.dae</uri>
+          </mesh>
+        </geometry>
+        <material>
+          <ambient>0.65 0.65 0.65 1</ambient>
+          <diffuse>0.92 0.92 0.92 1</diffuse>
+          <specular>0.12 0.12 0.12 1</specular>
+          <emissive>0 0 0 1</emissive>
+        </material>
+      </visual>
+      <collision name="collision">
+        <pose>0 0 0 0 0 -1.5708</pose>
+        <geometry>
+          <mesh>
+            <uri>meshes/Boat05.dae</uri>
+          </mesh>
+        </geometry>
+        <laser_retro>0.52</laser_retro>
+      </collision>
+    </link>
+    <plugin name="vessel_e_buoyancy" filename="libbuoyancy_gazebo_plugin.so">
+      <wave_model>ocean_waves</wave_model>
+      <fluid_density>1000</fluid_density>
+      <fluid_level>0.0</fluid_level>
+      <linear_drag>20.0</linear_drag>
+      <angular_drag>3.0</angular_drag>
+      <buoyancy name="buoyancy_sphere">
+        <link_name>link</link_name>
+        <pose>0 0 0.2 0 0 0</pose>
+        <geometry>
+          <sphere>
+            <radius>0.3</radius>
+          </sphere>
+        </geometry>
+      </buoyancy>
+    </plugin>
+    <plugin name="vessel_e_follow" filename="libfollow_plugin.so">
+      <link_name>link</link_name>
+      <loop_forever>true</loop_forever>
+      <waypoints>
+	<waypoint>-596.808 285.329 2.308</waypoint>
+	<waypoint>-635.461 316.683 2.905</waypoint>
+	<waypoint>-687.242 329.161 2.905</waypoint>
+      </waypoints>
+    </plugin>
+  </model>
+</sdf>

@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>buoy_course</name>
+  <version>0.1.0</version>
+  <description>
+    Buoy racing circuit package for the Otter USV.
+    Provides LiDAR-based buoy detection/tracking, COLREGS-aware
+    course planning with A*, and lap metrics (clearance + time).
+  </description>
+
+  <maintainer email="you@example.com">Your Name</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>roscpp</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>pcl_ros</depend>
+  <depend>pcl_conversions</depend>
+  <depend>adaptive_clustering</depend>
+  <exec_depend>coverage_boustrophedon</exec_depend>  <!-- for simple_dubins_path_node -->
+  <exec_depend>guidance</exec_depend>
+  <exec_depend>map_inflating</exec_depend>
+
+</package>

@@ -1,0 +1,92 @@
+<?xml version="1.0"?>
+<launch>
+
+  <!--  Arguments you can override from parent launch -->
+  <arg name="pointcloud_topic"  default="/lidar_blueboat/points" />
+  <arg name="target_frame"      default="map" />
+  <arg name="sensor_model"      default="HDL-32E" />
+  <arg name="criterion"         default="CLOSENESS" />
+
+  <!-- Dock size filter -->
+  <arg name="min_dock_length"   default="8.0" />
+  <arg name="max_dock_length"   default="40.0" />
+  <arg name="min_dock_width"    default="2.0" />
+  <arg name="max_dock_width"    default="20.0" />
+
+  <!-- Z slice -->
+  <arg name="z_axis_min"        default="-0.1" />
+  <arg name="z_axis_max"        default="5" />
+
+  <arg name="cluster_size_min"  default="20" />
+  <arg name="cluster_size_max"  default="10000" />
+
+  <!--  1. Adaptive clustering  -->
+  <node name="adaptive_clustering" pkg="adaptive_clustering"
+        type="adaptive_clustering" output="screen">
+    <param name="sensor_model"      value="$(arg sensor_model)" />
+    <param name="z_axis_min"        value="$(arg z_axis_min)" />
+    <param name="z_axis_max"        value="$(arg z_axis_max)" />
+    <param name="cluster_size_min"  value="$(arg cluster_size_min)" />
+    <param name="cluster_size_max"  value="$(arg cluster_size_max)" />
+    <param name="print_fps"         value="false" />
+    <remap from="velodyne_points"   to="$(arg pointcloud_topic)" />
+  </node>
+
+  <!--  2. Dock pose estimator (now also publishes /dock_dims)  -->
+  <node name="dock_pose_estimator" pkg="dock_perception"
+        type="l_shape_fitting" output="screen">
+    <param name="target_frame"       value="$(arg target_frame)" />
+    <param name="criterion"          value="$(arg criterion)" />
+    <param name="min_dock_length"    value="$(arg min_dock_length)" />
+    <param name="max_dock_length"    value="$(arg max_dock_length)" />
+    <param name="min_dock_width"     value="$(arg min_dock_width)" />
+    <param name="max_dock_width"     value="$(arg max_dock_width)" />
+    <param name="min_cluster_points" value="$(arg cluster_size_min)" />
+    <param name="merge_radius"       value="3.0" />
+    <param name="lock_after_frames"  value="10" />
+  </node>
+
+  <!--  3. Dock approach planner  -->
+  <node name="dock_approach_planner" pkg="dock_perception"
+        type="dock_approach_planner" output="screen">
+    <param name="map_frame"            value="$(arg target_frame)" />
+    <param name="start_delay"          value="6.0" />
+
+    <!-- Which wall to dock against:
+         "port"      = left wall (+short_axis face)
+         "starboard" = right wall (-short_axis face) -->
+    <param name="dock_side"          value="starboard" />
+
+    <!-- Bow direction relative to dock frame:
+         "+x" = bow along +long_axis (up if dock vertical)
+         "-x" = bow along -long_axis (down)
+         "-y" = bow away from wall, stern into dock -->
+    <param name="bow_direction"      value="-x" />
+
+    <!-- Clearance beyond the inflated costmap boundary (m).
+         Goal = bbox_edge + inflation_radius + berth_standoff -->
+    <param name="berth_standoff"       value="1.0" />
+
+    <!-- Must match the inflation_radius in map_inflating.launch -->
+    <param name="inflation_radius"     value="3.0" />
+
+    <!-- Shift along dock wall from centre (m) -->
+    <param name="berth_long_offset"    value="0.0" />
+
+    <!-- Reverse leg length (m) -->
+    <param name="staging_distance"     value="8.0" />
+
+    <!-- State transition thresholds (m) -->
+    <param name="staging_tolerance"    value="2.0" />
+    <param name="goal_tolerance"       value="2" />
+
+    <!-- Path re-publish interval (seconds) -->
+    <param name="path_update_interval" value="5.0" />
+
+    <param name="dock_pose_timeout"    value="5.0" />
+    <param name="costmap_lethal_thresh" value="100" />
+    <param name="path_downsample"    value="1.0" />
+  </node>
+
+  <node name="docking_metric" pkg="dock_perception" type="docking_metric_node" output="screen"/>
+</launch>

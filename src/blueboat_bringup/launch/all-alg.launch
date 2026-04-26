@@ -1,0 +1,30 @@
+<?xml version="1.0" ?>
+<launch>
+
+  <!-- Use sim time everywhere -->
+  <param name="/use_sim_time" value="true"/>
+
+  <!-- 1) Gazebo world -->
+  <include file="$(find blueboat)/launch/test.launch"/>
+  
+
+  <include file="$(find blueboat)/launch/rviz.launch"/>
+
+  <!-- 2) Robot + localization map to odom-->
+  <include file="$(find blueboat)/launch/gps_imu_global.launch"/>
+ <!-- <include file="$(find blueboat)/launch/one_ekf_localization.launch"/> 
+  
+  <include file="$(find blueboat)/launch/gmapping.launch"/>-->
+  <include file="$(find fast_lio)/launch/mapping_velodyne.launch"/>
+  
+  <!-- 3) AMCL 
+  <include file="$(find blueboat)/launch/amcl.launch"/>-->
+  <!-- <include file="$(find fast_lio)/launch/fastlio_noisy.launch"/> -->
+
+  <!-- 4) move_base-->
+  <include file="$(find blueboat)/launch/move_base.launch"/> 
+  <include file="$(find blueboat)/launch/pcl2_laserscan_map.launch"/> 
+
+  <include file="$(find blueboat)/launch/keydrive.launch"/>
+
+</launch>

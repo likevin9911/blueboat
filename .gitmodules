@@ -1,0 +1,12 @@
+[submodule "src/steering_functions"]
+	path = src/steering_functions
+	url = git@github.com:likevin9911/steering_functions.git
+[submodule "src/adaptive_clustering"]
+	path = src/adaptive_clustering
+	url = git@github.com:likevin9911/adaptive_clustering.git
+[submodule "src/lidar_auto_docking"]
+	path = src/lidar_auto_docking
+	url = git@github.com:likevin9911/lidar_auto_docking.git
+[submodule "src/allan_variance_ros"]
+	path = src/allan_variance_ros
+	url = git@github.com:likevin9911/allan_variance_ros.git

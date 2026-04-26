@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<launch>
+
+  <node pkg="blueboat_bringup" type="return_home" name="return_home">
+    <param name="waypoint_x"       value="-14.0"/>
+    <param name="waypoint_y"       value="20.0"/>
+    <param name="position_tolerance" value="1.5"/>
+    <param name="heading_tolerance"  value="0.25"/>   
+    <param name="goal_tolerance"  value="0.25"/>  
+    <param name="home_x"           value="0.0"/>
+    <param name="home_y"           value="0.0"/>
+    <param name="home_heading"     value="0.0"/>
+    <param name="map_frame"        value="map"/>
+  </node>
+
+
+</launch>

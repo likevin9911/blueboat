@@ -1,0 +1,30 @@
+<?xml version="1.0" ?>
+
+<launch>
+
+  
+  <arg name="scan_topic" default="/lidar/scan"/>
+  <node pkg="pointcloud_to_laserscan" type="pointcloud_to_laserscan_node"
+        name="cloud_to_scan" output="screen">
+    <remap from="cloud_in" to="/lidar_blueboat/points"/>
+    <remap from="scan" to="/lidar/scan"/>  
+
+    <!-- Scan parameters -->
+    <param name="min_height" value="-0.5"/>   
+    <param name="max_height" value="8.0"/>
+    <param name="range_min" value="1.0"/>
+    <param name="range_max" value="100.0"/>   
+    <param name="angle_min" value="-3.14159"/>
+    <param name="angle_max" value="3.14159"/>
+    <param name="angle_increment" value="0.0087266"/> <!-- ~0.5 deg -->
+    <param name="scan_time" value="0.1"/>
+    <param name="use_inf" value="true"/>
+    <param name="target_frame" value="base_link"/>
+  </node>
+
+ <node pkg="map_server" type="map_server" name="map_server"
+        args="$(find blueboat_navigation)/maps/dock.yaml" />
+
+  
+
+</launch>

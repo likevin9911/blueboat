@@ -1,0 +1,54 @@
+# buoy_course/config/course_config.yaml
+#
+# Course mark definition for a 4-buoy circuit.
+#
+# COLREGS channel marking convention:
+#   port mark     (would be red)    = pass to STARBOARD (right side)
+#   starboard mark (would be green) = pass to PORT (left side)
+#
+# Since we cannot detect buoy color from LiDAR, the port/starboard
+# assignment is defined here by the course designer based on known
+# world position. buoy_sequence matches the order buoys are confirmed
+# by the tracker (by ascending ID = first-seen order).
+#
+# Typical rectangular course (viewed from above):
+#
+#   Buoy 3 -------- Buoy 4
+#      |                |
+#   Buoy 2 -------- Buoy 1
+#              START
+#
+# Traversal order: 1 -> 2 -> 3 -> 4 -> back to start (clockwise)
+
+course_marks:
+  - buoy_sequence: 1
+    mark: "starboard"     # pass to left (counter-clockwise around buoy)
+    offset: 4.0
+
+  - buoy_sequence: 2
+    mark: "port"          # pass to right
+    offset: 4.0
+
+  - buoy_sequence: 3
+    mark: "starboard"
+    offset: 4.0
+
+  - buoy_sequence: 4
+    mark: "port"
+    offset: 4.0
+
+# Start/finish position (must match world spawn point)
+start_x: 0.0
+start_y: 0.0
+
+# How close (m) the robot must be to a waypoint to consider it reached
+goal_tolerance: 3.0
+
+# Default lateral offset from buoy centre to rounding waypoint (m)
+rounding_offset: 4.0
+
+# How many buoys to expect on the course
+buoy_count: 4
+
+# Replanning frequency (Hz)
+plan_rate: 2.0

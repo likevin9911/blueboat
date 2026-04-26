@@ -1,0 +1,60 @@
+TebLocalPlannerROS:
+  # Trajectory Configuration
+  teb_autosize: True
+  dt_ref: 0.5  # Larger timestep for slow boats
+  dt_hysteresis: 0.1
+  max_samples: 500
+  global_plan_overwrite_orientation: True
+  allow_init_with_backwards_motion: False  # Boats can't reverse well
+  max_global_plan_lookahead_dist: 10.0  # Look far ahead
+  global_plan_viapoint_sep: 0.5
+  
+  # Robot Configuration - CRITICAL FOR BOATS
+  max_vel_x: 2.0  # Your boat's max forward speed (m/s)
+  max_vel_x_backwards: 0.3  # Boats reverse poorly
+  max_vel_theta: 0.5  # Max turn rate (rad/s)
+  acc_lim_x: 0.3  # Slow acceleration
+  acc_lim_theta: 0.3  # Slow angular acceleration
+  
+  # Kinematic constraints for underactuated vehicle
+  min_turning_radius: 2.0  # IMPORTANT: Your boat's minimum turn radius (m)
+  wheelbase: 0.0  # Not applicable for boats
+  cmd_angle_instead_rotvel: False
+  
+  # Goal Tolerance - Looser for boats
+  xy_goal_tolerance: 10 # 50cm tolerance
+  yaw_goal_tolerance: 1.5  # ~17 degrees
+  free_goal_vel: False
+  
+  # Obstacles
+  min_obstacle_dist: 2.0  # Keep 1m from obstacles
+  inflation_dist: 2.0
+  include_costmap_obstacles: True
+  costmap_obstacles_behind_robot_dist: 2.0
+  obstacle_poses_affected: 30
+  
+  # Optimization
+  no_inner_iterations: 5
+  no_outer_iterations: 4
+  optimization_activate: True
+  optimization_verbose: False
+  penalty_epsilon: 0.1
+  
+  # Weight parameters - tune these for your boat
+  weight_max_vel_x: 2.0
+  weight_max_vel_theta: 1.0
+  weight_acc_lim_x: 1.0
+  weight_acc_lim_theta: 1.0
+  weight_kinematics_nh: 100.0  # Penalize non-holonomic constraints
+  weight_kinematics_forward_drive: 50.0  # Strong preference for forward motion
+  weight_kinematics_turning_radius: 20.0  # Respect turn radius
+  weight_optimaltime: 1.0
+  weight_obstacle: 50.0
+  
+  # Homotopy Class Planner (optional - helps with alternative paths)
+  enable_homotopy_class_planning: False  # Start with False, enable if needed
+  
+  # Recovery
+  shrink_horizon_backup: True
+  shrink_horizon_min_duration: 10.0
+  oscillation_recovery: False

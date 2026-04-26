@@ -1,0 +1,93 @@
+<?xml version="1.0"?>
+<launch>
+
+  <arg name="world" default="$(find blueboat_gazebo)/worlds/example_course.world" />
+  <arg name="gui" default="false" />
+  <arg name="verbose" default="false"/>
+
+  <arg name="blueboat_locked" default="false" />
+
+
+  <!-- Original 
+  <arg name="x" default="-585.025" />
+  <arg name="y" default="301.241" />
+  <arg name="z" default="0.1" />
+  <arg name="R" default="0" />
+  <arg name="P" default="0" />
+  <arg name="Y" default="3.01" />-->
+
+  <!-- Boats 
+  <arg name="x" default="-730.48" />
+  <arg name="y" default="327.0202" />
+  <arg name="z" default="0.1" />
+  <arg name="R" default="0" />
+  <arg name="P" default="0" />
+  <arg name="Y" default="-0.17143" />-->
+
+  <!-- Dock turn off dock_2022 in example course world
+  <arg name="x" default="-560.285778" />
+  <arg name="y" default="218.714843" />
+  <arg name="z" default="0.2" />
+  <arg name="R" default="0" />
+  <arg name="P" default="0" />
+  <arg name="Y" default="3.089001" />-->
+
+  <!-- Circuit Loop -->
+  <arg name="x" default="-497.096" />
+  <arg name="y" default="200.921" />
+  <arg name="z" default="0.1" />
+  <arg name="R" default="0" />
+  <arg name="P" default="0" />
+  <arg name="Y" default="1.649" />
+  
+
+  <arg name="locked" default="false" />
+  <arg name="camera_enabled" default="true" />
+  <arg name="gps_enabled" default="true" />
+  <arg name="imu_enabled" default="true" />
+  <arg name="lidar_enabled" default="true" />
+  <arg name="sonar_enabled" default="false" />
+  <arg name="ground_truth_enabled" default="true" />
+  <arg name="direct_control_plugin" default="false" />
+
+  <arg name="namespace"     default=""     />
+  <arg name="start_gazebo"  default="true" /> 
+  <arg name="use_gmapping" default="false" />
+
+  <include file="$(find gazebo_ros)/launch/empty_world.launch">
+    <arg name="world_name"   value="$(arg world)"/>
+    <arg name="verbose"      value="$(arg verbose)"/>
+    <arg name="paused"       value="false"/>
+    <arg name="use_sim_time" value="true"/>
+    <arg name="gui"          value="$(arg gui)" />
+  </include>
+
+  <arg name="urdf" default="$(find blueboat_gazebo)/urdf/blueboat_gazebo.urdf.xacro"/>
+  <param name="robot_description"
+            command="$(find xacro)/xacro $(arg urdf)
+            locked:=$(arg locked)
+            imu_enabled:=$(arg imu_enabled)
+            gps_enabled:=$(arg gps_enabled)
+            lidar_enabled:=$(arg lidar_enabled)
+            sonar_enabled:=$(arg sonar_enabled)
+            camera_enabled:=$(arg camera_enabled)
+            ground_truth_enabled:=$(arg ground_truth_enabled)
+            direct_control_plugin:=$(arg direct_control_plugin)" />
+
+  <node name="urdf_spawner" pkg="gazebo_ros" type="spawn_model"
+        respawn="false" output="screen"
+        args="-urdf -param /robot_description -model blueboat
+              -x $(arg x) -y $(arg y) -z $(arg z)
+              -R $(arg R) -P $(arg P) -Y $(arg Y)"/>
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher"
+        type="robot_state_publisher" output="screen">
+    <param name="publish_frequency" value="50.0"/>
+  </node>
+
+  <node name="joint_state_publisher" pkg="joint_state_publisher"
+        type="joint_state_publisher" output="screen"/>
+
+
+
+</launch>

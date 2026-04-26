@@ -1,0 +1,537 @@
+inside loop: course_planner
+#include <buoy_course/course_planner.h>
+
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/Int32.h>
+
+#include <cmath>
+#include <algorithm>
+#include <limits>
+
+namespace buoy_course
+{
+
+CoursePlanner::CoursePlanner()
+  : m_nhP("~")
+  , m_tfListener(m_tfBuffer)
+  , m_state(CourseState::WAITING_FOR_BUOYS)
+  , m_currentMarkIdx(0)
+  , m_robotPsi(0.0)
+{
+  m_mapFrame       = m_nhP.param<std::string>("map_frame",    "map");
+  m_goalTolerance  = m_nhP.param("goal_tolerance",            2.5);
+  m_roundingOffset = m_nhP.param("rounding_offset",           5.0);
+  m_startX         = m_nhP.param("start_x",                   0.0);
+  m_startY         = m_nhP.param("start_y",                   0.0);
+  m_buoyCount      = m_nhP.param("buoy_count",                4);
+  m_planRate       = m_nhP.param("plan_rate",                  1.0);
+  m_fovHalfAngle   = m_nhP.param("fov_half_angle_deg",        110.0) * M_PI / 180.0;
+
+  m_buoySub = m_nh.subscribe("buoy_map",    10, &CoursePlanner::buoyCb, this);
+  m_mapSub  = m_nh.subscribe("inflated_map", 1, &CoursePlanner::mapCb,  this);
+
+  m_pathPub     = m_nh.advertise<nav_msgs::Path>("simple_dubins_path", 10);
+  m_activeIdPub = m_nh.advertise<std_msgs::Int32>("active_buoy_id",    10);
+  m_statusPub   = m_nh.advertise<std_msgs::Bool>("lap_finished",       10, true);
+
+  m_planTimer = m_nh.createTimer(
+      ros::Duration(1.0 / m_planRate), &CoursePlanner::timerCb, this);
+
+  ROS_INFO("[CoursePlanner] Started. buoy_count=%d  offset=%.2f  fov=%.0f deg",
+           m_buoyCount, m_roundingOffset, m_fovHalfAngle * 180.0 / M_PI);
+}
+
+void CoursePlanner::buoyCb(const geometry_msgs::PoseArray::ConstPtr& msg)
+{
+  m_confirmedBuoys = msg->poses;
+  while (m_visited.size() < m_confirmedBuoys.size())
+    m_visited.push_back(false);
+}
+
+void CoursePlanner::mapCb(const nav_msgs::OccupancyGrid::ConstPtr& msg)
+{
+  m_map = msg;
+}
+
+void CoursePlanner::timerCb(const ros::TimerEvent&)
+{
+  geometry_msgs::TransformStamped tf_stamped;
+  try
+  {
+    tf_stamped = m_tfBuffer.lookupTransform(
+        m_mapFrame, "base_link", ros::Time(0), ros::Duration(0.1));
+  }
+  catch (tf2::TransformException& ex)
+  {
+    ROS_WARN_THROTTLE(5.0, "[CoursePlanner] TF error: %s", ex.what());
+    return;
+  }
+
+  m_robotX   = tf_stamped.transform.translation.x;
+  m_robotY   = tf_stamped.transform.translation.y;
+  m_robotPsi = tf2::getYaw(tf_stamped.transform.rotation);
+
+  updateFSM(m_robotX, m_robotY, m_robotPsi);
+}
+
+// ============================================================
+// FOV — only buoys within forward cone
+// ============================================================
+bool CoursePlanner::inFOV(double rx, double ry, double psi,
+                           double bx, double by) const
+{
+  double diff = std::atan2(by - ry, bx - rx) - psi;
+  while (diff >  M_PI) diff -= 2.0 * M_PI;
+  while (diff < -M_PI) diff += 2.0 * M_PI;
+  return std::fabs(diff) < m_fovHalfAngle;
+}
+
+// ============================================================
+// Nearest unvisited buoy in FOV
+// ============================================================
+int CoursePlanner::findNearestUnvisitedBuoy(double rx, double ry) const
+{
+  int    best  = -1;
+  double bdist = std::numeric_limits<double>::max();
+  for (int i = 0; i < static_cast<int>(m_confirmedBuoys.size()); i++)
+  {
+    if (i < static_cast<int>(m_visited.size()) && m_visited[i]) continue;
+    double bx = m_confirmedBuoys[i].position.x;
+    double by = m_confirmedBuoys[i].position.y;
+    if (!inFOV(rx, ry, m_robotPsi, bx, by)) continue;
+    double d = std::hypot(rx - bx, ry - by);
+    if (d < bdist) { bdist = d; best = i; }
+  }
+  return best;
+}
+
+int CoursePlanner::visitedCount() const
+{
+  return static_cast<int>(std::count(m_visited.begin(), m_visited.end(), true));
+}
+
+// ============================================================
+// Rounding waypoint — single point offset to the RIGHT of buoy
+// (CW pass = starboard side)
+//
+// The waypoint is placed at offset_dist to the RIGHT of the
+// approach vector. "Right" when facing the buoy from the robot.
+//
+//   Robot ----approach----> Buoy
+//                            |
+//                         (RIGHT = CW)
+//                            |
+//                         Waypoint  <-- boat drives here, buoy is to its left
+//
+// This is exactly what Indy 500 robots do with track boundary points —
+// target a point beside the obstacle, let the controller handle the curve.
+// ============================================================
+geometry_msgs::PoseStamped CoursePlanner::computeRoundingWaypoint(
+    const geometry_msgs::Pose& buoy,
+    double approach_x, double approach_y,
+    double offset) const
+{
+  // Unit vector: robot -> buoy
+  double dx = buoy.position.x - approach_x;
+  double dy = buoy.position.y - approach_y;
+  double d  = std::hypot(dx, dy);
+  if (d < 1e-3) { dx = 1.0; dy = 0.0; d = 1.0; }
+  dx /= d; dy /= d;
+
+  // Right perpendicular (CW): rotate approach -90 deg => (dy, -dx)
+  double rx_perp =  dy;
+  double ry_perp = -dx;
+
+  // Waypoint = buoy + right_perp * offset
+  // This places the waypoint to the RIGHT of the buoy when
+  // approaching from the robot's direction
+  geometry_msgs::PoseStamped wp;
+  wp.header.frame_id = m_mapFrame;
+  wp.header.stamp    = ros::Time::now();
+  wp.pose.position.x = buoy.position.x + rx_perp * offset;
+  wp.pose.position.y = buoy.position.y + ry_perp * offset;
+  wp.pose.position.z = 0.0;
+
+  // Heading: continue past the buoy in the approach direction
+  // so the boat exits cleanly without stopping
+  double exit_yaw = std::atan2(dy, dx);
+  tf2::Quaternion q;
+  q.setRPY(0, 0, exit_yaw);
+  wp.pose.orientation = tf2::toMsg(q);
+
+  ROS_INFO("[CoursePlanner] Waypoint for buoy (%.2f,%.2f): (%.2f,%.2f)  offset=%.2f CW",
+           buoy.position.x, buoy.position.y,
+           wp.pose.position.x, wp.pose.position.y, offset);
+
+  return wp;
+}
+
+// ============================================================
+// FSM
+// ============================================================
+void CoursePlanner::updateFSM(double rx, double ry, double psi)
+{
+  switch (m_state)
+  {
+    // ── Wait until at least one buoy is in FOV ───────────────
+    case CourseState::WAITING_FOR_BUOYS:
+    {
+      ROS_INFO_THROTTLE(3.0, "[CoursePlanner] Waiting for buoy in FOV... "
+                        "%zu confirmed", m_confirmedBuoys.size());
+      if (findNearestUnvisitedBuoy(rx, ry) >= 0)
+        transitionTo(CourseState::PLANNING);
+      break;
+    }
+
+    // ── Pick nearest unvisited buoy in FOV, plan A* to its waypoint ──
+    case CourseState::PLANNING:
+    {
+      if (!m_map)
+      {
+        ROS_WARN_THROTTLE(3.0, "[CoursePlanner] Waiting for map...");
+        break;
+      }
+
+      if (visitedCount() >= m_buoyCount)
+      {
+        transitionTo(CourseState::RETURNING);
+        break;
+      }
+
+      int target = findNearestUnvisitedBuoy(rx, ry);
+      if (target < 0)
+      {
+        ROS_INFO_THROTTLE(3.0, "[CoursePlanner] No unvisited buoy in FOV. "
+                          "visited=%d/%d", visitedCount(), m_buoyCount);
+        break;
+      }
+
+      m_currentMarkIdx = target;
+      const geometry_msgs::Pose& buoy = m_confirmedBuoys[target];
+
+      // Single offset waypoint to the right of the buoy (CW pass)
+      m_currentGoal = computeRoundingWaypoint(
+          buoy, rx, ry, m_roundingOffset);
+
+      double gwx = m_currentGoal.pose.position.x;
+      double gwy = m_currentGoal.pose.position.y;
+
+      // A* to the waypoint
+      nav_msgs::Path path;
+      if (!planPath(rx, ry, gwx, gwy, path))
+      {
+        ROS_WARN("[CoursePlanner] A* failed for buoy %d. Retrying.", target + 1);
+        break;
+      }
+
+      m_pathPub.publish(path);
+      publishActiveBuoyId(target + 1);
+
+      ROS_INFO("[CoursePlanner] -> Buoy %d at (%.2f,%.2f)  wp=(%.2f,%.2f)  %zu poses",
+               target + 1,
+               buoy.position.x, buoy.position.y,
+               gwx, gwy, path.poses.size());
+
+      transitionTo(CourseState::NAVIGATING);
+      break;
+    }
+
+    // ── Follow path — commit when entering rounding zone ─────
+    case CourseState::NAVIGATING:
+    {
+      if (m_currentMarkIdx >= static_cast<int>(m_confirmedBuoys.size()))
+      {
+        transitionTo(CourseState::PLANNING);
+        break;
+      }
+
+      const geometry_msgs::Pose& buoy = m_confirmedBuoys[m_currentMarkIdx];
+      double buoy_dist = std::hypot(rx - buoy.position.x, ry - buoy.position.y);
+      double wp_dist   = std::hypot(rx - m_currentGoal.pose.position.x,
+                                    ry - m_currentGoal.pose.position.y);
+
+      ROS_INFO_THROTTLE(2.0,
+          "[CoursePlanner] NAVIGATING buoy %d | buoy_dist=%.2f  wp_dist=%.2f",
+          m_currentMarkIdx + 1, buoy_dist, wp_dist);
+
+      // Commit to rounding when within 2x offset of the buoy
+      if (buoy_dist < m_roundingOffset * 2.0)
+        transitionTo(CourseState::ROUNDING);
+
+      break;
+    }
+
+    // ── Committed rounding — only exit is reaching the waypoint ──
+    case CourseState::ROUNDING:
+    {
+      // No replanning, no target switching until waypoint reached
+      const geometry_msgs::Pose& buoy = m_confirmedBuoys[m_currentMarkIdx];
+      double buoy_dist = std::hypot(rx - buoy.position.x, ry - buoy.position.y);
+      double wp_dist   = std::hypot(rx - m_currentGoal.pose.position.x,
+                                    ry - m_currentGoal.pose.position.y);
+
+      ROS_INFO_THROTTLE(1.0,
+          "[CoursePlanner] ROUNDING buoy %d | buoy_dist=%.2f  wp_dist=%.2f  tol=%.2f",
+          m_currentMarkIdx + 1, buoy_dist, wp_dist, m_goalTolerance);
+
+      if (wp_dist < m_goalTolerance)
+      {
+        ROS_INFO("[CoursePlanner] *** Buoy %d ROUNDED *** closest_pass=%.2f m",
+                 m_currentMarkIdx + 1, buoy_dist);
+
+        if (m_currentMarkIdx < static_cast<int>(m_visited.size()))
+          m_visited[m_currentMarkIdx] = true;
+
+        publishActiveBuoyId(-1);
+
+        if (visitedCount() >= m_buoyCount)
+          transitionTo(CourseState::RETURNING);
+        else
+          transitionTo(CourseState::PLANNING);
+      }
+      break;
+    }
+
+    // ── All buoys done — return to start ─────────────────────
+    case CourseState::RETURNING:
+    {
+      static bool path_sent = false;
+      if (!path_sent)
+      {
+        nav_msgs::Path path;
+        if (planPath(rx, ry, m_startX, m_startY, path))
+        {
+          m_pathPub.publish(path);
+          ROS_INFO("[CoursePlanner] Returning to start (%.1f,%.1f).", m_startX, m_startY);
+          path_sent = true;
+        }
+      }
+      if (std::hypot(rx - m_startX, ry - m_startY) < m_goalTolerance)
+      {
+        transitionTo(CourseState::FINISHED);
+        path_sent = false;
+      }
+      break;
+    }
+
+    // ── Done ─────────────────────────────────────────────────
+    case CourseState::FINISHED:
+    {
+      nav_msgs::Path empty;
+      empty.header.stamp    = ros::Time::now();
+      empty.header.frame_id = m_mapFrame;
+      m_pathPub.publish(empty);
+      std_msgs::Bool done;
+      done.data = true;
+      m_statusPub.publish(done);
+      ROS_INFO_THROTTLE(10.0, "[CoursePlanner] Course COMPLETE!");
+      break;
+    }
+  }
+}
+
+void CoursePlanner::transitionTo(CourseState s)
+{
+  if (s == m_state) return;
+  ROS_INFO("[CoursePlanner] %s -> %s",
+           stateName(m_state).c_str(), stateName(s).c_str());
+  m_state = s;
+}
+
+std::string CoursePlanner::stateName(CourseState s) const
+{
+  switch (s)
+  {
+    case CourseState::WAITING_FOR_BUOYS: return "WAITING_FOR_BUOYS";
+    case CourseState::PLANNING:          return "PLANNING";
+    case CourseState::NAVIGATING:        return "NAVIGATING";
+    case CourseState::ROUNDING:          return "ROUNDING";
+    case CourseState::RETURNING:         return "RETURNING";
+    case CourseState::FINISHED:          return "FINISHED";
+    default:                             return "UNKNOWN";
+  }
+}
+
+void CoursePlanner::publishActiveBuoyId(int id)
+{
+  std_msgs::Int32 msg;
+  msg.data = id;
+  m_activeIdPub.publish(msg);
+}
+
+// ============================================================
+// A*
+// ============================================================
+bool CoursePlanner::planPath(double sx, double sy,
+                              double gx_w, double gy_w,
+                              nav_msgs::Path& path_out)
+{
+  if (!m_map) { ROS_ERROR("[CoursePlanner] No map."); return false; }
+
+  int sx_g, sy_g, gx_g, gy_g;
+  if (!worldToGrid(sx, sy, sx_g, sy_g) ||
+      !worldToGrid(gx_w, gy_w, gx_g, gy_g))
+  {
+    ROS_WARN("[CoursePlanner] Start(%.2f,%.2f) or goal(%.2f,%.2f) outside map.",
+             sx, sy, gx_w, gy_w);
+    return false;
+  }
+
+  // Nudge goal out of obstacle if needed
+  if (!isFree(gx_g, gy_g))
+  {
+    bool found = false;
+    for (int r = 1; r < 20 && !found; r++)
+      for (int ddx = -r; ddx <= r && !found; ddx++)
+        for (int ddy = -r; ddy <= r && !found; ddy++)
+          if ((std::abs(ddx) == r || std::abs(ddy) == r) &&
+              isFree(gx_g + ddx, gy_g + ddy))
+          { gx_g += ddx; gy_g += ddy; found = true; }
+    if (!found)
+    { ROS_ERROR("[CoursePlanner] Goal occupied, no free cell."); return false; }
+  }
+
+  int W = m_map->info.width;
+  int H = m_map->info.height;
+  auto idx = [W](int x, int y){ return y * W + x; };
+
+  std::vector<float> g_cost(W * H, std::numeric_limits<float>::max());
+  std::vector<bool>  closed(W * H, false);
+  std::vector<std::pair<int,int>> parent(W * H, {-1, -1});
+
+  using PQ = std::priority_queue<AStarNode,
+                                  std::vector<AStarNode>,
+                                  std::greater<AStarNode>>;
+  PQ open;
+  g_cost[idx(sx_g, sy_g)] = 0.0f;
+  AStarNode s0;
+  s0.x = sx_g; s0.y = sy_g;
+  s0.g = 0.0f; s0.h = heuristic(sx_g, sy_g, gx_g, gy_g);
+  open.push(s0);
+
+  const int   DX[8] = { 1,-1, 0, 0, 1, 1,-1,-1};
+  const int   DY[8] = { 0, 0, 1,-1, 1,-1, 1,-1};
+  const float DC[8] = { 1, 1, 1, 1, 1.414f,1.414f,1.414f,1.414f};
+
+  bool found = false;
+  int  iters = 0;
+
+  while (!open.empty() && iters++ < W * H)
+  {
+    AStarNode cur = open.top(); open.pop();
+    if (closed[idx(cur.x, cur.y)]) continue;
+    closed[idx(cur.x, cur.y)] = true;
+    if (cur.x == gx_g && cur.y == gy_g) { found = true; break; }
+
+    for (int i = 0; i < 8; i++)
+    {
+      int nx = cur.x + DX[i];
+      int ny = cur.y + DY[i];
+      if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+      if (!isFree(nx, ny) || closed[idx(nx, ny)]) continue;
+      float ng = g_cost[idx(cur.x, cur.y)] + DC[i];
+      if (ng < g_cost[idx(nx, ny)])
+      {
+        g_cost[idx(nx, ny)] = ng;
+        parent[idx(nx, ny)] = {cur.x, cur.y};
+        AStarNode nb;
+        nb.x = nx; nb.y = ny;
+        nb.g = ng; nb.h = heuristic(nx, ny, gx_g, gy_g);
+        open.push(nb);
+      }
+    }
+  }
+
+  if (!found)
+  { ROS_WARN("[CoursePlanner] A* no path (%d iters).", iters); return false; }
+
+  // Reconstruct
+  std::vector<std::pair<int,int>> cells;
+  int cx = gx_g, cy = gy_g;
+  while (cx != -1)
+  {
+    cells.push_back({cx, cy});
+    auto p = parent[idx(cx, cy)];
+    cx = p.first; cy = p.second;
+  }
+  std::reverse(cells.begin(), cells.end());
+
+  path_out.header.stamp    = ros::Time::now();
+  path_out.header.frame_id = m_mapFrame;
+  path_out.poses.clear();
+
+  for (size_t i = 0; i < cells.size(); i++)
+  {
+    double wx, wy;
+    gridToWorld(cells[i].first, cells[i].second, wx, wy);
+    double yaw = 0.0;
+    if (i + 1 < cells.size())
+    {
+      double nx2, ny2;
+      gridToWorld(cells[i+1].first, cells[i+1].second, nx2, ny2);
+      yaw = std::atan2(ny2 - wy, nx2 - wx);
+    }
+    else if (i > 0)
+    {
+      double px2, py2;
+      gridToWorld(cells[i-1].first, cells[i-1].second, px2, py2);
+      yaw = std::atan2(wy - py2, wx - px2);
+    }
+    geometry_msgs::PoseStamped ps;
+    ps.header = path_out.header;
+    ps.pose.position.x = wx;
+    ps.pose.position.y = wy;
+    ps.pose.position.z = 0.0;
+    tf2::Quaternion q; q.setRPY(0, 0, yaw);
+    ps.pose.orientation = tf2::toMsg(q);
+    path_out.poses.push_back(ps);
+  }
+
+  return true;
+}
+
+bool CoursePlanner::worldToGrid(double wx, double wy, int& gx, int& gy) const
+{
+  if (!m_map) return false;
+  double res = m_map->info.resolution;
+  gx = static_cast<int>((wx - m_map->info.origin.position.x) / res);
+  gy = static_cast<int>((wy - m_map->info.origin.position.y) / res);
+  return gx >= 0 && gx < static_cast<int>(m_map->info.width) &&
+         gy >= 0 && gy < static_cast<int>(m_map->info.height);
+}
+
+bool CoursePlanner::gridToWorld(int gx, int gy, double& wx, double& wy) const
+{
+  if (!m_map) return false;
+  wx = m_map->info.origin.position.x + (gx + 0.5) * m_map->info.resolution;
+  wy = m_map->info.origin.position.y + (gy + 0.5) * m_map->info.resolution;
+  return true;
+}
+
+bool CoursePlanner::isFree(int gx, int gy) const
+{
+  if (!m_map) return false;
+  if (gx < 0 || gx >= static_cast<int>(m_map->info.width) ||
+      gy < 0 || gy >= static_cast<int>(m_map->info.height)) return false;
+  return m_map->data[gy * m_map->info.width + gx] <= 0;
+}
+
+float CoursePlanner::heuristic(int ax, int ay, int bx, int by) const
+{
+  float dx = static_cast<float>(bx - ax);
+  float dy = static_cast<float>(by - ay);
+  return std::sqrt(dx * dx + dy * dy);
+}
+
+} // namespace buoy_course
+
+int main(int argc, char** argv)
+{
+  ros::init(argc, argv, "course_planner_node");
+  buoy_course::CoursePlanner node;
+  ros::spin();
+  return 0;
+}
+
+

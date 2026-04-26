@@ -1,0 +1,246 @@
+<?xml version="1.0" ?>
+<launch>
+
+  <!-- ============================================================
+       Top-level task and pipeline configuration
+       ============================================================ -->
+  <arg name="task"         default="point_to_point"
+       doc="point_to_point | coverage"/>
+  <arg name="search_mode"  default="astar"
+       doc="none | astar | rrt"/>
+  <arg name="planner_type" default="cc_dubins"
+       doc="dubins | cc_dubins | reeds_shepp | hc_rs"/>
+  <arg name="use_vfh"      default="true"
+       doc="true | false  (true wires VFH between guidance and controller)"/>
+
+  <arg name="turning_radius"  default="1.0"/>
+  <arg name="path_resolution" default="0.05"/>
+  <arg name="max_sharpness"   default="1.0"/>
+
+  <param name="/use_sim_time" value="true"/>
+
+  <!-- ============================================================
+       Sim, mapping, localization (unchanged)
+       ============================================================ -->
+  <include file="$(find blueboat_gazebo)/launch/test.launch">
+    <arg name="gui" default="false" />
+  </include>
+  <include file="$(find blueboat_navigation)/launch/pcl2_laserscan_map.launch"/>
+  <include file="$(find blueboat_navigation)/launch/localization.launch"/>
+
+  <node name="cartographer_node" pkg="cartographer_ros"
+        type="cartographer_node" args="
+        -configuration_directory $(find blueboat_bringup)/config
+        -configuration_basename sim_blueboat.lua"
+        output="screen">
+    <remap from="scan" to="filtered_scan" />
+    <remap from="imu"  to="imu/data" />
+    <remap from="odom" to="odom" />
+  </node>
+
+  <include file="$(find map_inflating)/launch/map_inflating.launch">
+    <arg name="inflating_radius" value="3.0" />
+  </include>
+
+  <!-- ============================================================
+       Task layer
+       Point-to-point: goal_to_path_node bypasses search and feeds
+       waypoints directly. RViz click goes to /global_goal (used by
+       a_star/rrt) AND directly to /move_base_simple/goal which the
+       goal_to_path_node consumes.
+       Coverage: coverage_node emits /global_goal as it sweeps.
+       ============================================================ -->
+
+  <!-- For point_to_point WITHOUT search: bypass straight to /waypoints -->
+  <group if="$(eval arg('task') == 'point_to_point' and arg('search_mode') == 'none')">
+    <node name="goal_to_path_node" pkg="blueboat_control"
+          type="goal_to_path_node" output="screen">
+      <remap from="~waypoints" to="/waypoints"/>
+    </node>
+  </group>
+
+  <!-- For point_to_point WITH search: goal_to_path forwards click as /global_goal -->
+  <group if="$(eval arg('task') == 'point_to_point' and arg('search_mode') != 'none')">
+    <!-- Re-publish /move_base_simple/goal as /global_goal so a_star / rrt see it. -->
+    <node name="goal_relay" pkg="topic_tools" type="relay"
+          args="/move_base_simple/goal /global_goal" output="screen"/>
+  </group>
+
+  <!-- For coverage: coverage_node publishes /global_goal as it sweeps.
+       (Configure your coverage_node to publish PoseStamped goals on
+       /global_goal; original code published to move_base_simple/goal,
+       which is fine if you use the goal_relay above.) -->
+  <group if="$(eval arg('task') == 'coverage')">
+    <node name="coverage_node" pkg="blueboat_navigation"
+          type="coverage_node" output="screen">
+      <!-- coverage_node parameters per your existing config -->
+      <remap from="move_base_simple/goal" to="/global_goal"/>
+    </node>
+  </group>
+
+  <!-- ============================================================
+       Search layer
+       ============================================================ -->
+  <group if="$(eval arg('search_mode') == 'astar')">
+    <node name="astar_planner" pkg="blueboat_navigation"
+          type="astar_planner" output="screen">
+      <param name="planner_resolution" value="0.5"/>
+      <param name="obstacle_threshold" value="50"/>
+      <param name="allow_unknown"      value="true"/>
+      <remap from="~map"        to="/inflated_map"/>
+      <remap from="~goal"       to="/global_goal"/>
+      <remap from="~waypoints"  to="/waypoints"/>
+    </node>
+  </group>
+
+  <group if="$(eval arg('search_mode') == 'rrt')">
+    <node name="rrtstar_planner" pkg="blueboat_navigation"
+          type="rrtstar_planner" output="screen">
+      <param name="max_iterations"  value="5000"/>
+      <param name="goal_bias"       value="0.05"/>
+      <param name="step_size"       value="2.0"/>
+      <param name="rewire_radius"   value="4.0"/>
+      <param name="goal_tolerance"  value="1.0"/>
+      <param name="pad_margin"      value="10.0"/>
+      <param name="collision_step"  value="0.2"/>
+      <remap from="~map"        to="/inflated_map"/>
+      <remap from="~goal"       to="/global_goal"/>
+      <remap from="~waypoints"  to="/waypoints"/>
+    </node>
+  </group>
+
+  <!-- ============================================================
+       Path stitcher — adjacent waypoint pairs to steering planner
+       ============================================================ -->
+  <node name="path_stitch" pkg="blueboat_navigation"
+        type="path_stitch" output="screen">
+    <param name="segment_timeout" value="1.0"/>
+    <!-- Only hc_rs publishes per-pose curvature; the other three don't,
+         so the stitcher must not wait for or republish curvature data
+         when those are selected. -->
+    <param name="expect_curvatures"
+           value="$(eval arg('planner_type') == 'hc_rs')"/>
+    <remap from="~waypoints"          to="/waypoints"/>
+    <remap from="~steering_input"     to="/planning_input"/>
+    <remap from="~segment_path"       to="/planned_path_segment"/>
+    <remap from="~segment_curvature"  to="/planned_curvatures_segment"/>
+    <remap from="~full_path"          to="/planned_path"/>
+    <remap from="~full_curvatures"    to="/planned_curvatures"/>
+  </node>
+
+  <!-- ============================================================
+       Steering layer (one node, switchable). Now publishes to
+       /planned_path_segment so the stitcher catches each segment.
+       ============================================================ -->
+  <group if="$(eval arg('planner_type') == 'dubins')">
+    <node name="steering_planner" pkg="blueboat_navigation"
+          type="dubins_planner" output="screen">
+      <param name="turning_radius"  value="$(arg turning_radius)"/>
+      <param name="path_resolution" value="$(arg path_resolution)"/>
+      <param name="forwards_only"   value="true"/>
+      <remap from="~planning_input" to="/planning_input"/>
+      <remap from="~planned_path"   to="/planned_path_segment"/>
+    </node>
+  </group>
+
+  <group if="$(eval arg('planner_type') == 'cc_dubins')">
+    <node name="steering_planner" pkg="blueboat_navigation"
+          type="cc_dubins_planner" output="screen">
+      <param name="turning_radius"  value="$(arg turning_radius)"/>
+      <param name="path_resolution" value="$(arg path_resolution)"/>
+      <param name="max_sharpness"   value="$(arg max_sharpness)"/>
+      <param name="forwards_only"   value="true"/>
+      <remap from="~planning_input" to="/planning_input"/>
+      <remap from="~planned_path"   to="/planned_path_segment"/>
+    </node>
+  </group>
+
+  <group if="$(eval arg('planner_type') == 'reeds_shepp')">
+    <node name="steering_planner" pkg="blueboat_navigation"
+          type="reeds_shepp_planner" output="screen">
+      <param name="turning_radius"  value="$(arg turning_radius)"/>
+      <param name="path_resolution" value="$(arg path_resolution)"/>
+      <remap from="~planning_input" to="/planning_input"/>
+      <remap from="~planned_path"   to="/planned_path_segment"/>
+    </node>
+  </group>
+
+  <group if="$(eval arg('planner_type') == 'hc_rs')">
+    <node name="steering_planner" pkg="blueboat_navigation"
+          type="hc_rs_planner" output="screen">
+      <param name="turning_radius"  value="$(arg turning_radius)"/>
+      <param name="path_resolution" value="$(arg path_resolution)"/>
+      <param name="max_sharpness"   value="$(arg max_sharpness)"/>
+      <remap from="~planning_input"      to="/planning_input"/>
+      <remap from="~planned_path"        to="/planned_path_segment"/>
+      <remap from="~planned_curvatures"  to="/planned_curvatures_segment"/>
+    </node>
+  </group>
+
+  <!-- ============================================================
+       Guidance — reads /planned_path + /planned_curvatures, publishes
+       to /speed_heading_raw (or directly to /speed_heading if VFH off).
+       guidance.cpp publishes to "speed_heading"; we remap.
+       ============================================================ -->
+  <group if="$(arg use_vfh)">
+    <node name="guidance_node" pkg="guidance" type="guidance_node" output="screen">
+      <param name="path_topic"           value="/planned_path"/>
+      <param name="curvature_topic"      value="/planned_curvatures"/>
+      <param name="max_speed"            value="1.5"/>
+      <param name="max_speed_turn"       value="0.6"/>
+      <param name="min_speed"            value="0.1"/>
+      <param name="kappa_turn_threshold" value="0.2"/>
+      <remap from="speed_heading" to="/speed_heading_raw"/>
+    </node>
+  </group>
+
+  <group unless="$(arg use_vfh)">
+    <node name="guidance_node" pkg="guidance" type="guidance_node" output="screen">
+      <param name="path_topic"           value="/planned_path"/>
+      <param name="curvature_topic"      value="/planned_curvatures"/>
+      <param name="max_speed"            value="1.5"/>
+      <param name="max_speed_turn"       value="0.6"/>
+      <param name="min_speed"            value="0.1"/>
+      <param name="kappa_turn_threshold" value="0.2"/>
+      <!-- No remap: publishes directly to /speed_heading -->
+    </node>
+  </group>
+
+  <!-- ============================================================
+       VFH (optional) — only spawned if use_vfh is true
+       ============================================================ -->
+  <group if="$(arg use_vfh)">
+    <node name="vfh_node" pkg="blueboat_navigation" type="vfh_node" output="screen">
+      <param name="window_radius"               value="6.0"/>
+      <param name="bin_resolution"              value="5.0"/>
+      <param name="obstacle_distance_threshold" value="6.0"/>
+      <param name="hysteresis"                  value="true"/>
+      <param name="speed_scale_when_avoiding"   value="0.5"/>
+      <remap from="~speed_heading_in"  to="/speed_heading_raw"/>
+      <remap from="~speed_heading_out" to="/speed_heading"/>
+      <remap from="~scan"              to="/filtered_scan"/>
+    </node>
+  </group>
+
+  <!-- ============================================================
+       Controller — unchanged, still listens to /speed_heading
+       ============================================================ -->
+  <node name="BlueboatController" pkg="blueboat_control" type="controller">
+    <param name="Kp_psi"   value="4.0"/>
+    <param name="Kd_psi"   value="4.0"/>
+    <param name="Ki_psi"   value="1.0"/>
+    <param name="mass_psi" value="9.0"/>
+    <param name="damp_psi" value="20.0"/>
+    <param name="Kp_u"     value="2.0"/>
+    <param name="Ki_u"     value="1.0"/>
+    <param name="mass_u"   value="19.28"/>
+    <param name="damp_u"   value="20.0"/>
+  </node>
+
+  <!-- ============================================================
+       Visualization
+       ============================================================ -->
+  <node name="rviz" pkg="rviz" type="rviz" required="true"
+        args="-d $(find blueboat_navigation)/config/coverage.rviz"/>
+
+</launch>

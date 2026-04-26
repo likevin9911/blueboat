@@ -1,0 +1,37 @@
+<?xml version="1.0" ?>
+<launch>
+
+  <!-- Use sim time everywhere -->
+  <param name="/use_sim_time" value="true"/>
+
+  <!-- Gazebo -->
+  <include file="$(find blueboat_gazebo)/launch/test.launch">
+    <arg name="gui" default="true" />
+  </include>
+    <include file="$(find blueboat_bringup)/launch/rviz.launch"/>
+
+  <!-- localization -->
+  <include file="$(find blueboat_navigation)/launch/one_ekf_localization.launch"/> 
+  <include file="$(find blueboat_navigation)/launch/pcl2_laserscan_map.launch"/> 
+  <include file="$(find blueboat_navigation)/launch/amcl.launch"/>
+    <!-- <include file="$(find blueboat_navigation)/launch/gmapping.launch"/>  -->
+
+  <!-- Navigation -->
+  <include file="$(find blueboat_navigation)/launch/move_base.launch"/> 
+
+  <!-- Blueboat Controller PID -->
+  <!-- <node name="BlueboatController" pkg="blueboat_control" type="controller" /> -->
+
+  <!-- Bridge: cmd_vel to Speed heading -->
+  <!--<node  name="cmd_vel_bridge" pkg="blueboat_control" 
+        type="cmd_vel_to_speed_heading.py" output="screen">
+    <param name="heading_scale" value="0.5"/>
+  </node> -->
+
+
+  <!-- Teleop -->
+  <include file="$(find blueboat_control)/launch/keydrive.launch"/>
+
+  
+
+</launch>

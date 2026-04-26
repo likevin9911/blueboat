@@ -1,0 +1,38 @@
+<?xml version="1.0" ?>
+
+<launch>
+  <node pkg="real2sim_lidar_sensor"
+        type="real2sim_dnn_node"
+        name="real2sim_dnn_node"
+        output="screen">
+
+    <param name="input_cloud_topic" value="/blueboat/sensors/lidars/lidar_blueboat/points" />
+    <param name="cam_topic_name" value="/blueboat/sensors/cameras/front_camera/blueboat/sensors/cameras/front_camera/image_raw" />
+    <param name="frame_name" value="blueboat/lidar_blueboat_link" />
+
+    <param name="sensor_id" value="1" />
+    <param name="sensor_pose" value="0 0 0 0 0 0" />
+
+    <param name="output_topic" value="/blueboat/LiDAR1/pcl" />
+    <param name="output_topic_I" value="/blueboat/LiDAR1/pcl_I" />
+
+    <!-- Replace these with your actual lidar intrinsics -->
+    <param name="min_horizontal_angle" value="-3.14159265" />
+    <param name="max_horizontal_angle" value="3.14159265" />
+    <param name="min_vertical_angle" value="-0.261799" />
+    <param name="max_vertical_angle" value="0.261799" />
+
+    <!-- If your cloud arrives flattened, these must match the lidar layout -->
+    <param name="vertical_points_count" value="16" />
+    <param name="horizontal_points_count" value="1024" />
+
+    <param name="invalid_range_fill" value="100.0" />
+
+    <param name="cam_fov" value="1.3962634" />
+    <param name="gndThreshold" value="0.11" />
+    <param name="gndSegMorphological" value="1" />
+    <param name="numOfClasses" value="4" />
+    <param name="maxSensorTrainingRange" value="100.0" />
+    <param name="DnnPath" value="/home/ppninja/blueboat_ws/src/Real2Sim_gazebo/real2sim_lidar_sensor/network/frozen_graph_fastUnet.pb" />
+  </node>
+</launch>

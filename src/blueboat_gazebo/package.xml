@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>blueboat_gazebo</name>
+  <version>0.0.0</version>
+  <description>The blueboat_gazebo package</description>
+  <maintainer email="ppninja@todo.todo">ppninja</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- Core ROS/Gazebo -->
+  <depend>gazebo_dev</depend>
+  <depend>gazebo_ros</depend>
+  <depend>gazebo_msgs</depend>
+  <depend>gazebo_plugins</depend>
+  <depend>roscpp</depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>urdf</depend>
+  <depend>xacro</depend>
+  <depend>message_filters</depend>
+  <depend>robot_localization</depend>
+  <depend>geographic_msgs</depend>
+  <depend>vrx_gazebo</depend>
+
+  <!-- Message generation -->
+  <build_depend>message_generation</build_depend>
+  <exec_depend>message_runtime</exec_depend>
+
+  <!-- Simulation plugins -->
+  <depend>usv_gazebo_plugins</depend>
+  <depend>wave_gazebo</depend>
+
+  <!-- Sensor plugins -->
+  <depend>hector_gazebo_plugins</depend>
+  <depend>velodyne_gazebo_plugins</depend>
+  <depend>velodyne_description</depend>
+
+  <!-- Robot description -->
+  <depend>blueboat_description</depend>
+
+  <!-- Teleoperation -->
+  <depend>teleop_twist_keyboard</depend>
+
+</package>

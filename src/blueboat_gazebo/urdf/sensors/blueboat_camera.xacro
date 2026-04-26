@@ -1,0 +1,107 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+  <xacro:macro name="blueboat_camera" params="name x:=0.5 y:=0 z:=1.5 post_z_from:=1.2965 R:=0 P:=0 Y:=0 post_Y:=0 visualize:=True">
+
+    <!-- Monocular Camera -->
+    <link name="${name}_link">
+      <visual name="${name}_visual">
+        <origin xyz="-0.2 0 -0.29" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="package://blueboat_description/meshes/sensors/camera/d435i_camera.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+      </visual>
+      <collision name="camera_box_collision">
+          <origin rpy="0 0 0" xyz="-0.0205 0 0"/>
+          <geometry><box size="0.036 0.03 0.03"/></geometry>
+        </collision>
+      <!-- Model inertia as box with <size>0.078 0.03 0.03</size> -->
+      <inertial>
+        <mass value="0.3"/>
+        <inertia
+          ixx="0.0000450"
+          iyy="0.0001746"
+          izz="0.0001746"
+          ixy="0"
+          ixz="0"
+          iyz="0"/>
+      </inertial>
+    </link>
+
+    <link name="${name}_link_optical"/>
+
+    <!-- Base to Camera joint -->
+    <joint name="${name}__to_${name}_joint" type="fixed">
+      <origin xyz="${x} ${y} ${z}" rpy="${R} ${P} ${Y}"/>
+      <parent link="base_link" />
+      <child link="${name}_link" />
+    </joint>
+
+    <!-- Camera to optical frame joint -->
+    <joint name="${name}_to_${name}_optical_joint" type="fixed">
+      <origin xyz="0 0 0" rpy="${-pi/2} 0 ${-pi/2}" />
+      <parent link="${name}_link" />
+      <child link="${name}_link_optical" />
+    </joint>
+
+    <!-- Gazebo camera setup -->
+    <gazebo reference="${name}_link">
+      <sensor type="camera" name="${name}_sensor">
+        <update_rate>30.0</update_rate>
+	<xacro:if value="${visualize}">
+	  <visualize>true</visualize>
+	</xacro:if>
+        <camera name="${name}_camera">
+          <horizontal_fov>1.3962634</horizontal_fov>
+          <image>
+            <width>1280</width>
+            <height>720</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.1</near>
+            <far>300</far>
+          </clip>
+          <noise>
+            <type>gaussian</type>
+            <mean>0.0</mean>
+            <stddev>0.007</stddev>
+          </noise>
+        </camera>
+        <plugin name="camera_plugin_${name}" filename="libgazebo_ros_camera.so">
+          <alwaysOn>true</alwaysOn>
+          <updateRate>0.0</updateRate>
+          <cameraName>${name}</cameraName>
+          <imageTopicName>image_raw</imageTopicName>
+          <cameraInfoTopicName>camera_info</cameraInfoTopicName>
+          <frameName>${name}_link_optical</frameName>
+          <hackBaseline>0.07</hackBaseline>
+          <distortionK1>0.0</distortionK1>
+          <distortionK2>0.0</distortionK2>
+          <distortionK3>0.0</distortionK3>
+          <distortionT1>0.0</distortionT1>
+          <distortionT2>0.0</distortionT2>
+        </plugin>
+        <!--<plugin name="camera_plugin_${name}" filename="libgazebo_ros_openni_kinect.so">
+          <alwaysOn>true</alwaysOn>
+          <updateRate>30.0</updateRate>
+          <cameraName>${name}</cameraName>
+          <imageTopicName>${sensor_namespace}${camera_namespace}${name}/image_raw</imageTopicName>
+          <cameraInfoTopicName>${sensor_namespace}${camera_namespace}${name}/camera_info</cameraInfoTopicName>
+          <depthImageTopicName>${sensor_namespace}${camera_namespace}${name}/depth/image_raw</depthImageTopicName>
+          <depthImageCameraInfoTopicName>${sensor_namespace}${camera_namespace}${name}/depth/camera_info</depthImageCameraInfoTopicName>
+          <pointCloudTopicName>${sensor_namespace}${camera_namespace}${name}/depth/points</pointCloudTopicName>
+          <frameName>blueboat/blueboat_3d_lidar_link</frameName>
+      	  <hackBaseline>0.07</hackBaseline>
+      	  <distortionK1>0.0</distortionK1>
+       	  <distortionK2>0.0</distortionK2>
+       	  <distortionK3>0.0</distortionK3>
+       	  <distortionT1>0.0</distortionT1>
+       	  <distortionT2>0.0</distortionT2>
+       	  <pointCloudCutoff>0.1</pointCloudCutoff>
+       	  <pointCloudCutoffMax>100.0</pointCloudCutoffMax>
+       	</plugin>-->
+      </sensor>
+    </gazebo>
+
+  </xacro:macro>
+</robot>

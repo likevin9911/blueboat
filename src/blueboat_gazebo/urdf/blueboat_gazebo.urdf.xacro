@@ -1,0 +1,121 @@
+<?xml version="1.0"?>
+<!-- Basic BlueBoat with Gazebo plugins for dynamics -->
+<robot name="blueboat" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <xacro:arg name="locked" default="false" />
+  <xacro:arg name="camera_enabled" default="false" />
+  <xacro:arg name="gps_enabled" default="false" />
+  <xacro:arg name="imu_enabled" default="false" />
+  <xacro:arg name="lidar_enabled" default="false" />
+  <xacro:arg name="sonar_enabled" default="false" />
+  <xacro:arg name="ground_truth_enabled" default="false" />
+  <xacro:arg name="direct_control_plugin" default="false" />
+
+ 
+  <!-- Defines the "otter_base" macro -->
+  <xacro:include filename="$(find blueboat_description)/urdf/blueboat_base.urdf.xacro" />
+
+  <!-- Defines the "usv_dynamics_gazebo" macro -->
+  <xacro:include filename="$(find blueboat_gazebo)/urdf/dynamics/blueboat_gazebo_dynamics_plugin.xacro" />
+
+  <!-- Defines the "usv_wind_gazebo" macro -->
+  <xacro:include filename="$(find blueboat_gazebo)/urdf/dynamics/blueboat_gazebo_wind_plugin.xacro" />
+
+  <!-- Defines the "usv_thrust_gazebo" macro -->
+  <xacro:include filename="$(find blueboat_gazebo)/urdf/thrusters/blueboat_gazebo_thruster_plugin.xacro" />
+
+  <!-- Defines the "usv_direct_control_gazebo" macro -->
+  <xacro:include filename="$(find blueboat_gazebo)/urdf/blueboat_gazebo_direct_control_plugin.xacro" />
+
+  <!-- Define macros for sensors -->
+  <xacro:include filename="$(find blueboat_gazebo)/urdf/sensors/blueboat_gps.xacro" />
+  <xacro:include filename="$(find blueboat_gazebo)/urdf/sensors/blueboat_imu.xacro" />
+  <xacro:include filename="$(find blueboat_gazebo)/urdf/sensors/blueboat_3d_lidar.xacro" />
+  <xacro:include filename="$(find blueboat_gazebo)/urdf/sensors/blueboat_camera.xacro" />
+  <xacro:include filename="$(find blueboat_gazebo)/urdf/sensors/blueboat_p3d.xacro" />
+  <xacro:include filename="$(find blueboat_gazebo)/urdf/sensors/blueboat_planar_sonar.xacro" />
+  <xacro:include filename="$(find blueboat_gazebo)/urdf/sensors/lidar.xacro" />
+
+   <!-- Includes basic description of the Otter without plugins -->
+  <xacro:blueboat_base />
+
+  <!-- USV dynamics plugin -->
+  <xacro:usv_dynamics_gazebo name="blueboat"/>
+
+  <!-- Attach wind plugin -->
+  <xacro:usv_wind_gazebo name="blueboat"/>
+
+  <!-- USV thrust plugin -->
+  <xacro:usv_thrust_gazebo name="blueboat"/>
+    
+
+  <!-- === Decide if we lock the robot to the world === -->
+  <xacro:if value="$(arg locked)">
+    <gazebo>
+      <link name="blueboat_external_link"/>
+      <joint name="blueboat_external_pivot_joint" type="universal">
+        <parent>blueboat::base_link</parent>
+        <child>blueboat_external_link</child>
+        <axis>
+          <xyz>1 0 0</xyz>
+        </axis>
+        <axis2>
+          <xyz>0 1 0</xyz>
+        </axis2>
+      </joint>
+      <joint name="blueboat_external_riser" type="prismatic">
+        <parent>world</parent>
+        <child>blueboat_external_link</child>
+        <axis>
+          <limit>
+            <lower>-3</lower>
+            <upper>3</upper>
+          </limit>
+          <xyz>0 0 1</xyz>
+        </axis>
+      </joint>
+    </gazebo>
+  </xacro:if>
+
+  
+    <!-- Add simulated Camera -->
+    <xacro:if value="$(arg camera_enabled)">
+      <xacro:blueboat_camera name="front_camera" x="0.32" y="0" z="0.125" P="${radians(0)}" />
+    </xacro:if>
+    
+    <!-- Add simulated GPS -->
+    <xacro:if value="$(arg gps_enabled)">
+      <xacro:blueboat_gps name="gps_blueboat"  x="0.15" y="-0.37" z="0.125" />
+    </xacro:if>
+    
+    <!-- Add Simulated IMU -->
+    <xacro:if value="$(arg imu_enabled)">
+      <xacro:blueboat_imu name="imu_blueboat" x="0" y="0" z="0.25" />
+    </xacro:if>
+    
+    <!-- Add 3D LIDAR -->
+    <xacro:if value="$(arg lidar_enabled)">
+      <xacro:lidar name="lidar_blueboat" x="0" y="0" z="0.5" type="32_beam"/>
+    </xacro:if>
+    
+    <!-- Add P3D ground truth -->
+    <xacro:if value="$(arg ground_truth_enabled)">
+      <xacro:blueboat_p3d name="p3d_blueboat"/>
+    </xacro:if>
+    
+    <xacro:if value="$(arg direct_control_plugin)">
+      <xacro:usv_direct_control_gazebo name="otter"/>
+    </xacro:if>
+
+    <!-- Add pinger 
+    <xacro:if value="$(arg pinger_enabled)">
+      <xacro:blueboat_pinger name="pinger" position="0 0 -0.23" />
+    </xacro:if>-->
+    
+    <!-- Add 2D SONAR -->
+    <xacro:if value="$(arg sonar_enabled)">
+      <xacro:blueboat_multibeam_laser name="sonar" x="-0.2" y="0.25" z="-0.28"/>
+    </xacro:if>
+
+</robot>
+

@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<launch>
+  <node name="BlueboatController" pkg="blueboat_control" type="controller" >
+    <param name="/BlueboatController/Kp_psi"    value="4.0" />
+    <param name="/BlueboatController/Kd_psi"    value="4" />
+    <param name="/BlueboatController/Ki_psi"    value="1" />
+
+
+    <param name="mass_psi"        value="9"  />
+    <param name="damp_psi"        value="20" />
+
+    <param name="/BlueboatController/Kp_u"      value="2" />
+    <param name="/BlueboatController/Kd_u"      value="1" />
+    <param name="/BlueboatController/Ki_u"      value="0" />
+    
+    <param name="mass_u"          value="19.28" />
+    <param name="damp_u"          value="20.0" />
+    
+    <param name="/BlueboatController/Kp_u_rev"  value="2" />
+    <param name="/BlueboatController/Kd_u_rev"  value="1" />
+    <param name="/BlueboatController/Ki_u_rev"  value="0" />
+    
+    <param name="mass_rev"          value="27.0" />
+    <param name="damp_rev"          value="20.0" />
+    
+  </node>   
+  <node name="goal_to_path_node" pkg="blueboat_control" type="goal_to_path_node" output="screen">
+    <param name="path_resolution" value="0.2" />
+  </node>  
+  
+</launch>

@@ -1,0 +1,45 @@
+<?xml version="1.0" ?>
+<launch>
+
+  <param name="/use_sim_time" value="true"/>
+
+  <!-- 1) Gazebo world -->
+  <include file="$(find blueboat_gazebo)/launch/test.launch"/>
+
+  <!-- 2) RViz -->
+  <include file="$(find blueboat_bringup)/launch/rviz.launch"/>
+
+  <!-- 3) Sensor preprocessing: PCL → 2D laser scan -->
+  <include file="$(find blueboat_navigation)/launch/pcl2_laserscan_map.launch"/>
+
+  <!-- 4) Localization: EKF → /odom -->
+  <include file="$(find blueboat_navigation)/launch/localization.launch"/>
+
+  <!-- 5) Cartographer SLAM → /map -->
+  <node name="cartographer_node" pkg="cartographer_ros"
+        type="cartographer_node" args="
+        -configuration_directory $(find blueboat_bringup)/config
+        -configuration_basename sim_blueboat.lua"
+        output="screen">
+        <remap from="scan" to="filtered_scan" />
+        <remap from="imu"  to="imu/data" />
+        <remap from="odom" to="odom" />
+  </node>
+
+  <include file="$(find map_inflating)/launch/map_inflating.launch">
+    <arg name="inflating_radius" value="0.5" />
+  </include>
+
+
+  <!-- 8) Bridge: /cmd_vel (Twist) → /speed_heading (SpeedCourse) -->
+  <node name="cmd_vel_bridge" pkg="blueboat_control"
+        type="cmd_vel_to_speed_heading.py" output="screen">
+    <param name="odom_topic" value="/robot_localization/odometry/filtered"/>
+    <param name="yaw_scale"  value="1.0"/>
+  </node>
+
+  <!-- 9) Blueboat controller: /speed_heading → thrusters -->
+  <node name="BlueboatController" pkg="blueboat_control"
+        type="controller" output="screen"/>
+
+</launch>

@@ -1,0 +1,104 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://ros.org/wiki/xacro" name="blueboat">  
+  <xacro:macro name="blueboat_base">
+
+  <xacro:include filename="$(find blueboat_description)/urdf/materials.urdf.xacro" />
+  <!-- <xacro:include filename="$(find blueboat_description)/urdf/parts.mininertia.urdf.xacro" /> -->
+  <xacro:include filename="$(find blueboat_description)/urdf/propeller.xacro" />
+       
+  <!-- Dimensions (meters) -->
+  <xacro:property name="L" value="1.20"/>  <!-- length (x) -->
+  <xacro:property name="W" value="0.93"/>  <!-- width  (y) -->
+  <xacro:property name="H" value="0.46"/>  <!-- height (z) -->
+
+  <!-- Masses -->
+  <xacro:property name="m_hull" value="15.0"/>        <!-- boat+batteries -->
+  <xacro:property name="m_payload" value="9.07185"/>  <!-- 20 lb sensor suite -->
+
+  <!-- Payload placement + rough size (edit these to match your real mounting) -->
+  <xacro:property name="payload_xyz" value="0 0 0.3"/>  
+  <xacro:property name="pL" value="0.62"/>  <!-- payload box length -->
+  <xacro:property name="pW" value="0.40"/>  <!-- payload box width  -->
+  <xacro:property name="pH" value="0.43"/>  <!-- payload box height -->
+
+  <xacro:macro name="main_collisions" params="prefix reflect:=1">
+    <!-- Main float -->
+    <collision name="${prefix}_float">
+      <origin xyz="0 ${0.33*reflect} -0.05" rpy="${0*reflect} 0 0" />
+      <geometry>
+        <box size="1.2 0.2 0.4" />
+      </geometry>
+    </collision>
+  </xacro:macro>
+
+  <link name="base_link">
+    </link>
+
+    <joint name="dummy_joint" type = "fixed">
+      <parent link="base_link"/>
+      <child link="dummy_link"/>
+    </joint>
+ 
+  <!-- BlueBoat main body -->
+  <link name="dummy_link">
+    <!-- Visual -->
+    <visual>
+      <origin xyz="-0.6 -0.6 -0.25" rpy="1.57 0 1.57"/>
+      <geometry>
+        <mesh filename="package://blueboat_description/meshes/base/blueboat/mesh/blueboat.dae"
+              scale="0.001 0.001 0.001"/>
+      </geometry>
+    </visual>
+
+    <xacro:main_collisions prefix="left"  reflect="1"/>
+    <xacro:main_collisions prefix="right" reflect="-1"/>
+    
+    <collision name="top_base">
+      <origin xyz="0 0 0.13" rpy="0 0 0" />
+      <geometry>
+        <box size="1.2 0.925 0.05" />
+      </geometry>
+    </collision>
+    
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${m_hull}"/>
+      <!-- Ixx = m/12 (W^2 + H^2), Iyy = m/12 (L^2 + H^2), Izz = m/12 (L^2 + W^2) -->
+      <inertia ixx="1.345625" ixy="0.0" ixz="0.0" iyy="2.064500" iyz="0.0" izz="2.881125"/>
+    </inertial>
+  </link>
+  
+  <joint name="payload_joint" type="fixed">
+    <parent link="dummy_link"/>
+    <child link="payload_link"/>
+    <origin xyz="${payload_xyz}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="payload_link">
+    <collision name="payload_collision">
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${pL} ${pW} ${pH}"/>
+      </geometry>
+    </collision>
+
+    <inertial>
+      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
+      <mass value="${m_payload}"/>
+      <inertia ixx="0.261" ixy="0" ixz="0" iyy="0.431" iyz="0" izz="0.412"/>
+    </inertial>
+  </link>
+
+  <!-- Left propeller -->
+    <xacro:propeller prefix="left" position="-0.48 0.30 -0.145" />
+    <gazebo reference="left_propeller_link">
+      <material>Gazebo/Yellow</material>
+    </gazebo>
+
+    <!-- Right propeller -->
+    <xacro:propeller prefix="right" position="-0.48 -0.30 -0.145" />
+    <gazebo reference="right_propeller_link">
+      <material>Gazebo/Yellow</material>
+    </gazebo>
+  </xacro:macro>
+</robot>

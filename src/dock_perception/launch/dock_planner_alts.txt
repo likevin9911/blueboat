@@ -1,0 +1,1821 @@
+infinite uturns:
+// dock_approach_planner.cpp
+//
+// Coordinate convention (from dock_pose_estimator):
+//   dock_pose.position   = bounding box centre
+//   dock_pose.position.z = half the dock bounding-box width (centroid to face)
+//   dock_pose yaw        = inward face normal (points INTO dock, away from water)
+//
+// Berth side definition:
+//   "port"      = berth alongside the dock_yaw face (+X face in this world).
+//                 Boat drives past the dock end in +Y, U-turns, comes back
+//                 alongside the +X face. Bow faces away from dock (+X).
+//   "starboard" = berth alongside the owd face (-X/open-water face).
+//                 Boat drives past the dock end in -Y (or +Y), U-turns,
+//                 comes back alongside the -X face. Bow faces away (-X).
+//
+// Geometry for "port" (dock_yaw ≈ 7°, dock runs along Y):
+//
+//          +Y (up)
+//           |
+//     ------+------   <- dock top end
+//     |  dock     |
+//     |  centre   |   dock_yaw → (INTO dock, ≈+X)
+//     |           |
+//     ------+------   <- dock bottom end
+//           |
+//    open water (-Y, where robot starts)
+//
+//   berth_face = centroid + half_w * dock_yaw_unit   (right/+X face)
+//   berth      = berth_face + berth_standoff * dock_yaw_unit
+//   gate       = berth + gate_lateral * long_axis_unit   (above dock in +Y)
+//                (long axis = dock_yaw + 90° ≈ +Y direction)
+//
+//   Robot path: start → gate (drive up +Y) → U-turn → berth (come back -Y)
+//   Berth heading = -long_axis direction (facing -Y after U-turn, bow away from dock)
+//
+// For "starboard": berth_face on owd side, same logic mirrored.
+//
+// Map inflation: subscribes to /inflated_map and warns if gate/berth in collision.
+
+#include <ros/ros.h>
+#include <nav_msgs/Path.h>
+#include <nav_msgs/OccupancyGrid.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <std_msgs/Bool.h>
+
+#include <tf2_ros/transform_listener.h>
+#include <tf2/utils.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2/LinearMath/Quaternion.h>
+
+#include <cmath>
+#include <string>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+static double wrapAngle(double a)
+{
+  while (a >  M_PI) a -= 2.0 * M_PI;
+  while (a < -M_PI) a += 2.0 * M_PI;
+  return a;
+}
+
+static geometry_msgs::PoseStamped makePose(const std::string& frame,
+                                           double x, double y, double yaw)
+{
+  geometry_msgs::PoseStamped ps;
+  ps.header.frame_id = frame;
+  ps.header.stamp    = ros::Time::now();
+  ps.pose.position.x = x;
+  ps.pose.position.y = y;
+  ps.pose.position.z = 0.0;
+  tf2::Quaternion q;
+  q.setRPY(0.0, 0.0, yaw);
+  ps.pose.orientation = tf2::toMsg(q);
+  return ps;
+}
+
+// Straight path (x0,y0)->(x1,y1). Yaw blends to arrival_yaw over last blend_frac.
+static nav_msgs::Path straightPath(const std::string& frame,
+                                   double x0, double y0,
+                                   double x1, double y1,
+                                   double arrival_yaw,
+                                   double blend_frac = 0.5)
+{
+  nav_msgs::Path path;
+  path.header.frame_id = frame;
+  path.header.stamp    = ros::Time::now();
+
+  double dx  = x1 - x0, dy = y1 - y0;
+  double trav_yaw = std::atan2(dy, dx);
+  int steps = std::max(2, (int)(std::hypot(dx, dy) / 0.10));
+
+  for (int i = 0; i <= steps; ++i)
+  {
+    double frac = (double)i / steps;
+    double yaw;
+    if (frac < (1.0 - blend_frac))
+      yaw = trav_yaw;
+    else
+    {
+      double t = (frac - (1.0 - blend_frac)) / blend_frac;
+      yaw = wrapAngle(trav_yaw + t * wrapAngle(arrival_yaw - trav_yaw));
+    }
+    path.poses.push_back(makePose(frame, x0 + frac*dx, y0 + frac*dy, yaw));
+  }
+  return path;
+}
+
+// ---------------------------------------------------------------------------
+class DockApproachPlanner
+{
+public:
+  DockApproachPlanner() : nh_(), pnh_("~"), tf_listener_(tf_buffer_),
+                          state_(WAITING), dock_received_(false), have_map_(false)
+  {
+    pnh_.param<std::string>("map_frame",       map_frame_,      "map");
+    pnh_.param<double>("start_delay",          start_delay_,    8.0);
+
+    // "port"      = berth on dock_yaw side (+X face)
+    // "starboard" = berth on owd side      (-X / open-water face)
+    pnh_.param<std::string>("berth_side",      berth_side_,     "port");
+
+    // How far beyond the dock end (along long axis) the gate sits.
+    pnh_.param<double>("gate_lateral_offset",  gate_lateral_,   12.0);
+
+    // Extra standoff of gate perpendicular to dock face (away from dock).
+    // Gives the boat clearance from the dock end corner.
+    pnh_.param<double>("gate_standoff",        gate_standoff_,   4.0);
+
+    // Distance from dock face to berth (clear of the inflated costmap).
+    pnh_.param<double>("berth_standoff",       berth_standoff_,  2.5);
+
+    // Shift berth along dock long axis (0 = opposite dock centre).
+    pnh_.param<double>("berth_long_offset",    berth_long_,      0.0);
+
+    pnh_.param<double>("switch_radius",        switch_radius_,   3.0);
+    pnh_.param<double>("goal_tolerance",       goal_tolerance_,  1.2);
+    pnh_.param<double>("dock_pose_timeout",    dock_timeout_,    5.0);
+    pnh_.param<double>("path_publish_rate",    publish_rate_,    2.0);
+    pnh_.param<int>("costmap_lethal_thresh",   lethal_thresh_,   90);
+
+    dock_sub_ = nh_.subscribe("/dock_pose", 5,
+                              &DockApproachPlanner::dockPoseCb, this);
+    map_sub_  = nh_.subscribe("/inflated_map", 1,
+                              &DockApproachPlanner::mapCb, this);
+    path_pub_   = nh_.advertise<nav_msgs::Path>("simple_dubins_path", 5, true);
+    docked_pub_ = nh_.advertise<std_msgs::Bool>("docking/docked", 5, true);
+
+    ROS_INFO("[DockApproachPlanner] Ready.");
+    ROS_INFO("  berth_side         = %s",     berth_side_.c_str());
+    ROS_INFO("  gate_lateral_offset= %.1f m", gate_lateral_);
+    ROS_INFO("  gate_standoff      = %.1f m", gate_standoff_);
+    ROS_INFO("  berth_standoff     = %.1f m", berth_standoff_);
+    ROS_INFO("  start_delay        = %.1f s", start_delay_);
+
+    ros::Rate rate(publish_rate_);
+    while (nh_.ok())
+    {
+      update();
+      ros::spinOnce();
+      rate.sleep();
+    }
+  }
+
+private:
+  enum State { WAITING, APPROACHING, BERTHING, DOCKED };
+
+  void mapCb(const nav_msgs::OccupancyGrid::ConstPtr& msg)
+  { map_ = *msg;  have_map_ = true; }
+
+  void dockPoseCb(const geometry_msgs::PoseStamped::ConstPtr& msg)
+  {
+    geometry_msgs::PoseStamped in_map = *msg;
+    if (msg->header.frame_id != map_frame_)
+    {
+      try { tf_buffer_.transform(*msg, in_map, map_frame_, ros::Duration(0.1)); }
+      catch (tf2::TransformException& ex) {
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] TF: %s", ex.what()); return;
+      }
+    }
+    if (!dock_received_) {
+      first_dock_time_ = ros::Time::now();
+      dock_received_   = true;
+      ROS_INFO("[DockApproachPlanner] Dock received — waiting %.1f s.", start_delay_);
+    }
+    dock_pose_     = in_map;
+    last_dock_time_= ros::Time::now();
+  }
+
+  bool getRobotPose(double& rx, double& ry, double& ryaw)
+  {
+    geometry_msgs::TransformStamped tf;
+    try { tf = tf_buffer_.lookupTransform(map_frame_, "base_link",
+                                          ros::Time(0), ros::Duration(0.0)); }
+    catch (tf2::TransformException& ex) {
+      ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] TF base_link: %s", ex.what());
+      return false;
+    }
+    rx   = tf.transform.translation.x;
+    ry   = tf.transform.translation.y;
+    ryaw = tf2::getYaw(tf.transform.rotation);
+    return true;
+  }
+
+  bool inCollision(double wx, double wy) const
+  {
+    if (!have_map_) return false;
+    const auto& info = map_.info;
+    int mx = (int)((wx - info.origin.position.x) / info.resolution);
+    int my = (int)((wy - info.origin.position.y) / info.resolution);
+    if (mx < 0 || my < 0 || mx >= (int)info.width || my >= (int)info.height)
+      return true;
+    int8_t cost = map_.data[my * info.width + mx];
+    return (cost < 0 || cost >= lethal_thresh_);
+  }
+
+  bool pathInCollision(double x0, double y0, double x1, double y1) const
+  {
+    double dx = x1-x0, dy = y1-y0;
+    int steps = std::max(2, (int)(std::hypot(dx,dy) / 0.2));
+    for (int i = 0; i <= steps; ++i) {
+      double f = (double)i/steps;
+      if (inCollision(x0+f*dx, y0+f*dy)) return true;
+    }
+    return false;
+  }
+
+  // -------------------------------------------------------------------------
+  // Geometry:
+  //
+  // dock_yaw  = inward face normal (INTO dock)
+  // long_yaw  = dock_yaw + 90°  (along dock length, +Y when dock_yaw≈+X)
+  //
+  // PORT:
+  //   berth face = centroid + half_w along dock_yaw   (+X face)
+  //   berth      = berth_face + berth_standoff along dock_yaw
+  //   gate       = berth + gate_lateral along +long_yaw  (above dock in +Y)
+  //                      + gate_standoff along dock_yaw  (away from dock corner)
+  //   berth_hdg  = -long_yaw  (boat arrives from +Y, U-turns, faces -Y)
+  //
+  // STARBOARD:
+  //   berth face = centroid + half_w along owd        (-X / open-water face)
+  //   berth      = berth_face + berth_standoff along owd
+  //   gate       = berth + gate_lateral along +long_yaw
+  //                      + gate_standoff along owd
+  //   berth_hdg  = -long_yaw  (same U-turn logic)
+  // -------------------------------------------------------------------------
+  void computeGeometry(double& gate_x,  double& gate_y,
+                       double& berth_x, double& berth_y,
+                       double& berth_heading)
+  {
+    double dock_yaw = tf2::getYaw(dock_pose_.pose.orientation);
+    double cx       = dock_pose_.pose.position.x;
+    double cy       = dock_pose_.pose.position.y;
+    double half_w   = dock_pose_.pose.position.z;  // half dock bounding-box width
+
+    // Axis convention: +X = North, +Y = West
+    // dock_yaw ≈ 7° ≈ +X = North = face normal points North (INTO dock)
+    // dock runs East-West? No — dock long axis runs North-South along dock_yaw.
+    //
+    // Long axis = dock_yaw direction (along the dock length = North/South)
+    // Face axis = perpendicular to long axis:
+    //   port      = dock_yaw - 90° = East  (-Y direction) = right side
+    //   starboard = dock_yaw + 90° = West  (+Y direction) = left side
+    double long_yaw  = dock_yaw;  // along dock length
+    double lx = std::cos(long_yaw);
+    double ly = std::sin(long_yaw);
+
+    double face_yaw  = (berth_side_ == "port")
+                       ? wrapAngle(dock_yaw - M_PI_2)   // East face (-Y)
+                       : wrapAngle(dock_yaw + M_PI_2);  // West face (+Y)
+    double fnx = std::cos(face_yaw);
+    double fny = std::sin(face_yaw);
+
+    // Berth face = centroid shifted to chosen side face
+    double bface_x = cx + half_w * fnx;
+    double bface_y = cy + half_w * fny;
+
+    // Berth = berth face + standoff perpendicular away from dock
+    berth_x = bface_x + berth_standoff_ * fnx + berth_long_ * lx;
+    berth_y = bface_y + berth_standoff_ * fny + berth_long_ * ly;
+
+    // Gate: placed along the long axis from berth, on the side the robot
+    // needs to swing out to before U-turning back to berth.
+    // Auto-detect: put gate on opposite side from robot along long axis.
+    double rx = 0, ry = 0, ryaw = 0;
+    getRobotPose(rx, ry, ryaw);
+    double dot = lx*(rx - berth_x) + ly*(ry - berth_y);
+    // gate_sign: +1 = gate in +long_yaw (North), -1 = gate in -long_yaw (South)
+    double gate_sign = (dot >= 0) ? -1.0 : 1.0;
+
+    // Gate also offset away from dock face by gate_standoff for corner clearance
+    gate_x = berth_x + gate_sign * gate_lateral_ * lx + gate_standoff_ * fnx;
+    gate_y = berth_y + gate_sign * gate_lateral_ * ly + gate_standoff_ * fny;
+
+    // Berth heading: after U-turn, bow faces away from dock (along face normal)
+    // and along the long axis direction the boat came from.
+    // Boat came from gate_sign direction, so after U-turn faces -gate_sign * long_yaw.
+    // But we want bow facing AWAY from dock wall = face_yaw direction.
+    // Compromise: boat faces along face_yaw (bow away from dock, stern toward dock).
+    berth_heading = face_yaw;
+
+    ROS_INFO_THROTTLE(2.0,
+      "[DockApproachPlanner] dock=(%.1f,%.1f) yaw=%.1fdeg  side=%s"
+      "  face_yaw=%.1fdeg  long_yaw=%.1fdeg",
+      cx, cy, dock_yaw*180/M_PI, berth_side_.c_str(),
+      face_yaw*180/M_PI, long_yaw*180/M_PI);
+    ROS_INFO_THROTTLE(2.0,
+      "[DockApproachPlanner] bface=(%.1f,%.1f) gate=(%.1f,%.1f)"
+      " berth=(%.1f,%.1f) hdg=%.1fdeg  gate_sign=%.0f",
+      bface_x, bface_y, gate_x, gate_y,
+      berth_x, berth_y, berth_heading*180/M_PI, gate_sign);
+
+    if (have_map_)
+    {
+      if (inCollision(gate_x, gate_y))
+        ROS_WARN_THROTTLE(2.0,
+          "[DockApproachPlanner] gate in collision — increase gate_lateral or gate_standoff");
+      if (inCollision(berth_x, berth_y))
+        ROS_WARN_THROTTLE(2.0,
+          "[DockApproachPlanner] berth in collision — increase berth_standoff");
+      if (pathInCollision(gate_x, gate_y, berth_x, berth_y))
+        ROS_WARN_THROTTLE(2.0,
+          "[DockApproachPlanner] berth path in collision");
+    }
+  }
+
+  void publishEmpty()
+  {
+    nav_msgs::Path empty;
+    empty.header.frame_id = map_frame_;
+    empty.header.stamp    = ros::Time::now();
+    path_pub_.publish(empty);
+  }
+
+  void update()
+  {
+    if (!dock_received_) return;
+
+    if (state_ == WAITING)
+    {
+      double elapsed = (ros::Time::now() - first_dock_time_).toSec();
+      ROS_INFO_THROTTLE(2.0, "[DockApproachPlanner] WAITING %.1f/%.1f s",
+                        elapsed, start_delay_);
+      if (elapsed >= start_delay_) {
+        ROS_INFO("[DockApproachPlanner] Starting APPROACHING.");
+        state_ = APPROACHING;
+      }
+      return;
+    }
+
+    if ((ros::Time::now() - last_dock_time_).toSec() > dock_timeout_) {
+      ROS_WARN_THROTTLE(3.0, "[DockApproachPlanner] Dock pose stale."); return;
+    }
+
+    double rx, ry, ryaw;
+    if (!getRobotPose(rx, ry, ryaw)) return;
+
+    double gate_x, gate_y, berth_x, berth_y, berth_heading;
+    computeGeometry(gate_x, gate_y, berth_x, berth_y, berth_heading);
+
+    double dist_gate  = std::hypot(rx-gate_x,  ry-gate_y);
+    double dist_berth = std::hypot(rx-berth_x, ry-berth_y);
+
+    switch (state_)
+    {
+      case APPROACHING:
+      {
+        if (have_map_ && pathInCollision(rx, ry, gate_x, gate_y))
+          ROS_WARN_THROTTLE(1.0, "[DockApproachPlanner] Approach path in collision!");
+
+        path_pub_.publish(straightPath(map_frame_,
+                                       rx, ry, gate_x, gate_y,
+                                       berth_heading, 0.6));
+        ROS_INFO_THROTTLE(2.0, "[DockApproachPlanner] APPROACHING gate=(%.1f,%.1f) dist=%.1fm",
+                          gate_x, gate_y, dist_gate);
+        if (dist_gate < switch_radius_) {
+          ROS_INFO("[DockApproachPlanner] At gate — BERTHING.");
+          state_ = BERTHING;
+        }
+        break;
+      }
+
+      case BERTHING:
+      {
+        path_pub_.publish(straightPath(map_frame_,
+                                       rx, ry, berth_x, berth_y,
+                                       berth_heading, 0.15));
+        ROS_INFO_THROTTLE(1.0, "[DockApproachPlanner] BERTHING berth=(%.1f,%.1f) dist=%.1fm",
+                          berth_x, berth_y, dist_berth);
+        if (dist_berth < goal_tolerance_) {
+          ROS_INFO("[DockApproachPlanner] *** DOCKED ***");
+          state_ = DOCKED;
+          publishEmpty();
+          std_msgs::Bool msg; msg.data = true;
+          docked_pub_.publish(msg);
+        }
+        break;
+      }
+
+      case DOCKED:
+        publishEmpty();
+        break;
+
+      default: break;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  ros::NodeHandle nh_, pnh_;
+  ros::Subscriber dock_sub_, map_sub_;
+  ros::Publisher  path_pub_, docked_pub_;
+
+  tf2_ros::Buffer            tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
+
+  geometry_msgs::PoseStamped dock_pose_;
+  nav_msgs::OccupancyGrid    map_;
+  bool have_map_;
+  bool dock_received_ = false;
+  ros::Time first_dock_time_, last_dock_time_;
+
+  State state_;
+
+  std::string map_frame_;
+  double start_delay_;
+  std::string berth_side_;
+  double gate_lateral_;
+  double gate_standoff_;
+  double berth_standoff_;
+  double berth_long_;
+  double switch_radius_;
+  double goal_tolerance_;
+  double dock_timeout_;
+  double publish_rate_;
+  int    lethal_thresh_;
+};
+
+// ---------------------------------------------------------------------------
+int main(int argc, char** argv)
+{
+  ros::init(argc, argv, "dock_approach_planner");
+  DockApproachPlanner node;
+  return 0;
+}
+
+
+
+parks in front of dock: CURRENT
+// dock_approach_planner.cpp
+//
+// Geometry (dock_pose yaw = inward face normal, INTO the dock):
+//
+//         dock long axis
+//         <----------->
+//    ____________________
+//   |                    |  <- dock face (open water side)
+//   |____________________|
+//              |
+//           dock_yaw (points INTO dock)
+//              |
+//        open_water_dir = dock_yaw + PI
+//
+//  The berth is ALONGSIDE the dock (parallel to long axis).
+//  Gate point = purely lateral offset from dock centre along long axis,
+//               then backed off into open water. NOT along dock_yaw at all.
+//
+//  Steps:
+//   1. WAITING   — wait start_delay seconds for dock lock to settle
+//   2. APPROACHING — drive to gate point (lateral of dock in open water)
+//                    path yaw blends to berth_heading (parallel to dock)
+//   3. BERTHING  — drive from gate alongside dock face to berth point
+//   4. DOCKED    — stop
+//
+//  Costmap: subscribes to /inflated_map, checks each path point against
+//           the occupancy grid and warns if path is in collision.
+
+#include <ros/ros.h>
+#include <nav_msgs/Path.h>
+#include <nav_msgs/OccupancyGrid.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <std_msgs/Bool.h>
+
+#include <tf2_ros/transform_listener.h>
+#include <tf2/utils.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2/LinearMath/Quaternion.h>
+
+#include <cmath>
+#include <string>
+#include <vector>
+
+static double wrapAngle(double a)
+{
+  while (a >  M_PI) a -= 2.0 * M_PI;
+  while (a < -M_PI) a += 2.0 * M_PI;
+  return a;
+}
+
+static geometry_msgs::PoseStamped makePose(const std::string& frame,
+                                           double x, double y, double yaw)
+{
+  geometry_msgs::PoseStamped ps;
+  ps.header.frame_id = frame;
+  ps.header.stamp    = ros::Time::now();
+  ps.pose.position.x = x;
+  ps.pose.position.y = y;
+  ps.pose.position.z = 0.0;
+  tf2::Quaternion q;
+  q.setRPY(0.0, 0.0, yaw);
+  ps.pose.orientation = tf2::toMsg(q);
+  return ps;
+}
+
+// Straight-line path from (x0,y0) to (x1,y1).
+// Yaw blends from travel direction to arrival_yaw over the last blend_frac.
+static nav_msgs::Path straightPath(const std::string& frame,
+                                   double x0, double y0,
+                                   double x1, double y1,
+                                   double arrival_yaw,
+                                   double blend_frac = 0.5)
+{
+  nav_msgs::Path path;
+  path.header.frame_id = frame;
+  path.header.stamp    = ros::Time::now();
+
+  double dx       = x1 - x0;
+  double dy       = y1 - y0;
+  double dist     = std::hypot(dx, dy);
+  double trav_yaw = std::atan2(dy, dx);
+
+  const double RES = 0.10;
+  int steps = std::max(2, (int)(dist / RES));
+
+  for (int i = 0; i <= steps; ++i)
+  {
+    double frac = (double)i / (double)steps;
+    double yaw;
+    if (frac < (1.0 - blend_frac))
+      yaw = trav_yaw;
+    else
+    {
+      double t    = (frac - (1.0 - blend_frac)) / blend_frac;
+      double dyaw = wrapAngle(arrival_yaw - trav_yaw);
+      yaw = wrapAngle(trav_yaw + t * dyaw);
+    }
+    path.poses.push_back(makePose(frame, x0 + frac*dx, y0 + frac*dy, yaw));
+  }
+  return path;
+}
+
+// -------------------------------------------------------------------------
+class DockApproachPlanner
+{
+public:
+  DockApproachPlanner() : nh_(), pnh_("~"), tf_listener_(tf_buffer_),
+                          state_(WAITING), dock_received_(false),
+                          have_map_(false)
+  {
+    pnh_.param<std::string>("map_frame",       map_frame_,       "map");
+    pnh_.param<double>("start_delay",          start_delay_,     8.0);
+
+    // How far out from the dock ALONG THE LONG AXIS to place the gate.
+    // This is the lateral distance — boat comes from the side, not the front.
+    pnh_.param<double>("gate_lateral_offset",  gate_lateral_,    12.0); // m along long axis
+
+    // How far off the dock FACE (open water direction) the gate sits.
+    // Gives clearance from the dock end.
+    pnh_.param<double>("gate_standoff",        gate_standoff_,   6.0);  // m off dock face
+
+    // Which side of the dock long axis to berth on.
+    // "port" = +90° from open_water_dir, "starboard" = -90°
+    pnh_.param<std::string>("berth_side",      berth_side_,      "port");
+
+    // How far off the dock face at the berth (m).
+    pnh_.param<double>("berth_standoff",       berth_standoff_,  1.5);
+
+    // Where along the dock long axis to berth (0 = dock centre).
+    // Positive = toward berth_side gate direction.
+    pnh_.param<double>("berth_long_offset",    berth_long_,      0.0);
+
+    pnh_.param<double>("switch_radius",        switch_radius_,   2.5);
+    pnh_.param<double>("goal_tolerance",       goal_tolerance_,  1.2);
+    pnh_.param<double>("dock_pose_timeout",    dock_timeout_,    5.0);
+    pnh_.param<double>("path_publish_rate",    publish_rate_,    2.0);
+
+    // Costmap lethal threshold (0-100). Cells >= this are in collision.
+    pnh_.param<int>("costmap_lethal_thresh",   lethal_thresh_,   90);
+
+    dock_sub_ = nh_.subscribe("/dock_pose", 5,
+                              &DockApproachPlanner::dockPoseCb, this);
+    map_sub_  = nh_.subscribe("/inflated_map", 1,
+                              &DockApproachPlanner::mapCb, this);
+    path_pub_   = nh_.advertise<nav_msgs::Path>("simple_dubins_path", 5, true);
+    docked_pub_ = nh_.advertise<std_msgs::Bool>("docking/docked", 5, true);
+
+    ROS_INFO("[DockApproachPlanner] Ready.");
+    ROS_INFO("  berth_side         = %s",     berth_side_.c_str());
+    ROS_INFO("  gate_lateral_offset= %.1f m", gate_lateral_);
+    ROS_INFO("  gate_standoff      = %.1f m", gate_standoff_);
+    ROS_INFO("  berth_standoff     = %.1f m", berth_standoff_);
+    ROS_INFO("  start_delay        = %.1f s", start_delay_);
+
+    ros::Rate rate(publish_rate_);
+    while (nh_.ok())
+    {
+      update();
+      ros::spinOnce();
+      rate.sleep();
+    }
+  }
+
+private:
+  enum State { WAITING, APPROACHING, BERTHING, DOCKED };
+
+  // -----------------------------------------------------------------------
+  void mapCb(const nav_msgs::OccupancyGrid::ConstPtr& msg)
+  {
+    map_      = *msg;
+    have_map_ = true;
+  }
+
+  // -----------------------------------------------------------------------
+  void dockPoseCb(const geometry_msgs::PoseStamped::ConstPtr& msg)
+  {
+    geometry_msgs::PoseStamped in_map = *msg;
+    if (msg->header.frame_id != map_frame_)
+    {
+      try {
+        tf_buffer_.transform(*msg, in_map, map_frame_, ros::Duration(0.1));
+      } catch (tf2::TransformException& ex) {
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] TF: %s", ex.what());
+        return;
+      }
+    }
+    if (!dock_received_)
+    {
+      first_dock_time_ = ros::Time::now();
+      dock_received_   = true;
+      ROS_INFO("[DockApproachPlanner] First dock pose — waiting %.1f s.", start_delay_);
+    }
+    dock_pose_     = in_map;
+    last_dock_time_= ros::Time::now();
+  }
+
+  // -----------------------------------------------------------------------
+  bool getRobotPose(double& rx, double& ry, double& ryaw)
+  {
+    geometry_msgs::TransformStamped tf;
+    try {
+      tf = tf_buffer_.lookupTransform(map_frame_, "base_link",
+                                      ros::Time(0), ros::Duration(0.0));
+    } catch (tf2::TransformException& ex) {
+      ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] TF base_link: %s", ex.what());
+      return false;
+    }
+    rx   = tf.transform.translation.x;
+    ry   = tf.transform.translation.y;
+    ryaw = tf2::getYaw(tf.transform.rotation);
+    return true;
+  }
+
+  // -----------------------------------------------------------------------
+  // Check if a world point (wx, wy) is in collision on the inflated map.
+  // Returns true if occupied / unknown / outside map.
+  bool inCollision(double wx, double wy) const
+  {
+    if (!have_map_) return false;
+    const auto& info = map_.info;
+    int mx = (int)((wx - info.origin.position.x) / info.resolution);
+    int my = (int)((wy - info.origin.position.y) / info.resolution);
+    if (mx < 0 || my < 0 || mx >= (int)info.width || my >= (int)info.height)
+      return true;  // outside map = treat as occupied
+    int idx = my * info.width + mx;
+    int8_t cost = map_.data[idx];
+    return (cost < 0 || cost >= lethal_thresh_);  // -1=unknown, >=thresh=occupied
+  }
+
+  // Check all points on a path segment for collision.
+  bool pathInCollision(double x0, double y0, double x1, double y1) const
+  {
+    double dx   = x1 - x0, dy = y1 - y0;
+    double dist = std::hypot(dx, dy);
+    int    steps = std::max(2, (int)(dist / 0.2));
+    for (int i = 0; i <= steps; ++i)
+    {
+      double f = (double)i / steps;
+      if (inCollision(x0 + f*dx, y0 + f*dy)) return true;
+    }
+    return false;
+  }
+
+  // -----------------------------------------------------------------------
+  // Compute gate and berth from dock pose.
+  //
+  // dock_yaw  = inward face normal (into dock)
+  // owd       = dock_yaw + PI  = open water direction
+  // long_axis = owd ± 90°      = along dock face
+  //
+  // Gate is placed LATERALLY off the dock — along the long axis,
+  // backed off by gate_standoff in the open water direction.
+  // The boat approaches from the side, not the front.
+  //
+  void computeGeometry(double& gate_x,  double& gate_y,
+                       double& berth_x, double& berth_y,
+                       double& berth_heading)
+  {
+    double dock_yaw = tf2::getYaw(dock_pose_.pose.orientation);
+    double cx       = dock_pose_.pose.position.x;
+    double cy       = dock_pose_.pose.position.y;
+    // z encodes half the dock bounding-box width (centroid to open-water face)
+    double half_w   = dock_pose_.pose.position.z;
+
+    // Open water direction (away from dock face)
+    double owd = wrapAngle(dock_yaw + M_PI);
+
+    // Long axis: perpendicular to face normal
+    // port=+90 from owd, starboard=-90 from owd
+    double side_sign = (berth_side_ == "port") ? 1.0 : -1.0;
+    double long_yaw  = wrapAngle(owd + side_sign * M_PI_2);
+
+    // Unit vectors
+    double owx = std::cos(owd),       owy = std::sin(owd);
+    double lx  = std::cos(long_yaw),  ly  = std::sin(long_yaw);
+
+    // Dock face = centroid shifted by half_w toward open water
+    double face_x = cx + half_w * owx;
+    double face_y = cy + half_w * owy;
+
+    // Gate: beyond the dock end in open water
+    // gate_lateral  = how far along dock long axis past the end
+    // gate_standoff = how far into open water from the face
+    gate_x = face_x + gate_lateral_ * lx + gate_standoff_ * owx;
+    gate_y = face_y + gate_lateral_ * ly + gate_standoff_ * owy;
+
+    // Berth: alongside the dock face, berth_standoff off the face
+    // berth_long_ shifts along the dock axis (0 = opposite dock centre)
+    berth_x = face_x + berth_standoff_ * owx + berth_long_ * lx;
+    berth_y = face_y + berth_standoff_ * owy + berth_long_ * ly;
+
+    // Bow faces open water after U-turn (stern toward dock)
+    berth_heading = wrapAngle(long_yaw + M_PI);
+
+    ROS_INFO_THROTTLE(2.0,
+      "[DockApproachPlanner] dock=(%.1f,%.1f) yaw=%.1fdeg half_w=%.1f  owd=%.1fdeg  long=%.1fdeg  side=%s",
+      cx, cy, dock_yaw*180/M_PI, half_w, owd*180/M_PI, long_yaw*180/M_PI, berth_side_.c_str());
+    ROS_INFO_THROTTLE(2.0,
+      "[DockApproachPlanner] face=(%.1f,%.1f) gate=(%.1f,%.1f)  berth=(%.1f,%.1f)  berth_hdg=%.1fdeg",
+      face_x, face_y, gate_x, gate_y, berth_x, berth_y, berth_heading*180/M_PI);
+
+    if (have_map_)
+    {
+      if (pathInCollision(gate_x, gate_y, berth_x, berth_y))
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] WARNING: berth path in collision!");
+      if (inCollision(gate_x, gate_y))
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] WARNING: gate point in collision!");
+      if (inCollision(berth_x, berth_y))
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] WARNING: berth point in collision!");
+    }
+  }
+
+  void publishEmpty()
+  {
+    nav_msgs::Path empty;
+    empty.header.frame_id = map_frame_;
+    empty.header.stamp    = ros::Time::now();
+    path_pub_.publish(empty);
+  }
+
+  // -----------------------------------------------------------------------
+  void update()
+  {
+    if (!dock_received_) return;
+
+    if (state_ == WAITING)
+    {
+      double elapsed = (ros::Time::now() - first_dock_time_).toSec();
+      ROS_INFO_THROTTLE(2.0, "[DockApproachPlanner] WAITING %.1f/%.1f s",
+                        elapsed, start_delay_);
+      if (elapsed >= start_delay_)
+      {
+        ROS_INFO("[DockApproachPlanner] Starting APPROACHING.");
+        state_ = APPROACHING;
+      }
+      return;
+    }
+
+    if ((ros::Time::now() - last_dock_time_).toSec() > dock_timeout_)
+    {
+      ROS_WARN_THROTTLE(3.0, "[DockApproachPlanner] Dock pose stale.");
+      return;
+    }
+
+    double rx, ry, ryaw;
+    if (!getRobotPose(rx, ry, ryaw)) return;
+
+    double gate_x, gate_y, berth_x, berth_y, berth_heading;
+    computeGeometry(gate_x, gate_y, berth_x, berth_y, berth_heading);
+
+    double dist_to_gate  = std::hypot(rx - gate_x,  ry - gate_y);
+    double dist_to_berth = std::hypot(rx - berth_x, ry - berth_y);
+
+    switch (state_)
+    {
+      // ── APPROACHING ──────────────────────────────────────────────────────
+      // Drive to gate point. Path yaw blends to berth_heading so boat is
+      // already rotating into the U-turn before it arrives.
+      case APPROACHING:
+      {
+        // Check approach path for collision and warn
+        if (have_map_ && pathInCollision(rx, ry, gate_x, gate_y))
+          ROS_WARN_THROTTLE(1.0, "[DockApproachPlanner] Approach path in collision!");
+
+        nav_msgs::Path p = straightPath(map_frame_,
+                                        rx, ry, gate_x, gate_y,
+                                        berth_heading, 0.6);
+        path_pub_.publish(p);
+
+        ROS_INFO_THROTTLE(2.0,
+          "[DockApproachPlanner] APPROACHING gate (%.1f,%.1f) dist=%.1f m",
+          gate_x, gate_y, dist_to_gate);
+
+        if (dist_to_gate < switch_radius_)
+        {
+          ROS_INFO("[DockApproachPlanner] At gate — BERTHING.");
+          state_ = BERTHING;
+        }
+        break;
+      }
+
+      // ── BERTHING ──────────────────────────────────────────────────────────
+      // Short run parallel to dock face from gate to berth point.
+      case BERTHING:
+      {
+        nav_msgs::Path p = straightPath(map_frame_,
+                                        rx, ry, berth_x, berth_y,
+                                        berth_heading, 0.15);
+        path_pub_.publish(p);
+
+        ROS_INFO_THROTTLE(1.0,
+          "[DockApproachPlanner] BERTHING (%.1f,%.1f) dist=%.1f m",
+          berth_x, berth_y, dist_to_berth);
+
+        if (dist_to_berth < goal_tolerance_)
+        {
+          ROS_INFO("[DockApproachPlanner] *** DOCKED ***");
+          state_ = DOCKED;
+          publishEmpty();
+          std_msgs::Bool msg;
+          msg.data = true;
+          docked_pub_.publish(msg);
+        }
+        break;
+      }
+
+      case DOCKED:
+        publishEmpty();
+        break;
+
+      default: break;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  ros::NodeHandle nh_, pnh_;
+  ros::Subscriber dock_sub_;
+  ros::Subscriber map_sub_;
+  ros::Publisher  path_pub_;
+  ros::Publisher  docked_pub_;
+
+  tf2_ros::Buffer            tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
+
+  geometry_msgs::PoseStamped dock_pose_;
+  nav_msgs::OccupancyGrid    map_;
+  bool have_map_;
+  bool dock_received_ = false;
+  ros::Time first_dock_time_;
+  ros::Time last_dock_time_;
+
+  State state_;
+
+  std::string map_frame_;
+  double start_delay_;
+  double gate_lateral_;
+  double gate_standoff_;
+  std::string berth_side_;
+  double berth_standoff_;
+  double berth_long_;
+  double switch_radius_;
+  double goal_tolerance_;
+  double dock_timeout_;
+  double publish_rate_;
+  int    lethal_thresh_;
+};
+
+// -------------------------------------------------------------------------
+int main(int argc, char** argv)
+{
+  ros::init(argc, argv, "dock_approach_planner");
+  DockApproachPlanner node;
+  return 0;
+}
+
+running into dock:
+// dock_approach_planner.cpp
+//
+// Geometry (dock_pose yaw = inward face normal, INTO the dock):
+//
+//         dock long axis
+//         <----------->
+//    ____________________
+//   |                    |  <- dock face (open water side)
+//   |____________________|
+//              |
+//           dock_yaw (points INTO dock)
+//              |
+//        open_water_dir = dock_yaw + PI
+//
+//  The berth is ALONGSIDE the dock (parallel to long axis).
+//  Gate point = purely lateral offset from dock centre along long axis,
+//               then backed off into open water. NOT along dock_yaw at all.
+//
+//  Steps:
+//   1. WAITING   — wait start_delay seconds for dock lock to settle
+//   2. APPROACHING — drive to gate point (lateral of dock in open water)
+//                    path yaw blends to berth_heading (parallel to dock)
+//   3. BERTHING  — drive from gate alongside dock face to berth point
+//   4. DOCKED    — stop
+//
+//  Costmap: subscribes to /inflated_map, checks each path point against
+//           the occupancy grid and warns if path is in collision.
+
+#include <ros/ros.h>
+#include <nav_msgs/Path.h>
+#include <nav_msgs/OccupancyGrid.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <std_msgs/Bool.h>
+
+#include <tf2_ros/transform_listener.h>
+#include <tf2/utils.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2/LinearMath/Quaternion.h>
+
+#include <cmath>
+#include <string>
+#include <vector>
+
+static double wrapAngle(double a)
+{
+  while (a >  M_PI) a -= 2.0 * M_PI;
+  while (a < -M_PI) a += 2.0 * M_PI;
+  return a;
+}
+
+static geometry_msgs::PoseStamped makePose(const std::string& frame,
+                                           double x, double y, double yaw)
+{
+  geometry_msgs::PoseStamped ps;
+  ps.header.frame_id = frame;
+  ps.header.stamp    = ros::Time::now();
+  ps.pose.position.x = x;
+  ps.pose.position.y = y;
+  ps.pose.position.z = 0.0;
+  tf2::Quaternion q;
+  q.setRPY(0.0, 0.0, yaw);
+  ps.pose.orientation = tf2::toMsg(q);
+  return ps;
+}
+
+// Straight-line path from (x0,y0) to (x1,y1).
+// Yaw blends from travel direction to arrival_yaw over the last blend_frac.
+static nav_msgs::Path straightPath(const std::string& frame,
+                                   double x0, double y0,
+                                   double x1, double y1,
+                                   double arrival_yaw,
+                                   double blend_frac = 0.5)
+{
+  nav_msgs::Path path;
+  path.header.frame_id = frame;
+  path.header.stamp    = ros::Time::now();
+
+  double dx       = x1 - x0;
+  double dy       = y1 - y0;
+  double dist     = std::hypot(dx, dy);
+  double trav_yaw = std::atan2(dy, dx);
+
+  const double RES = 0.10;
+  int steps = std::max(2, (int)(dist / RES));
+
+  for (int i = 0; i <= steps; ++i)
+  {
+    double frac = (double)i / (double)steps;
+    double yaw;
+    if (frac < (1.0 - blend_frac))
+      yaw = trav_yaw;
+    else
+    {
+      double t    = (frac - (1.0 - blend_frac)) / blend_frac;
+      double dyaw = wrapAngle(arrival_yaw - trav_yaw);
+      yaw = wrapAngle(trav_yaw + t * dyaw);
+    }
+    path.poses.push_back(makePose(frame, x0 + frac*dx, y0 + frac*dy, yaw));
+  }
+  return path;
+}
+
+// -------------------------------------------------------------------------
+class DockApproachPlanner
+{
+public:
+  DockApproachPlanner() : nh_(), pnh_("~"), tf_listener_(tf_buffer_),
+                          state_(WAITING), dock_received_(false),
+                          have_map_(false)
+  {
+    pnh_.param<std::string>("map_frame",       map_frame_,       "map");
+    pnh_.param<double>("start_delay",          start_delay_,     8.0);
+
+    // How far out from the dock ALONG THE LONG AXIS to place the gate.
+    // This is the lateral distance — boat comes from the side, not the front.
+    pnh_.param<double>("gate_lateral_offset",  gate_lateral_,    12.0); // m along long axis
+
+    // How far off the dock FACE (open water direction) the gate sits.
+    // Gives clearance from the dock end.
+    pnh_.param<double>("gate_standoff",        gate_standoff_,   6.0);  // m off dock face
+
+    // Which side of the dock long axis to berth on.
+    // "port" = +90° from open_water_dir, "starboard" = -90°
+    pnh_.param<std::string>("berth_side",      berth_side_,      "port");
+
+    // How far off the dock face at the berth (m).
+    pnh_.param<double>("berth_standoff",       berth_standoff_,  1.5);
+
+    // Where along the dock long axis to berth (0 = dock centre).
+    // Positive = toward berth_side gate direction.
+    pnh_.param<double>("berth_long_offset",    berth_long_,      0.0);
+
+    pnh_.param<double>("switch_radius",        switch_radius_,   2.5);
+    pnh_.param<double>("goal_tolerance",       goal_tolerance_,  1.2);
+    pnh_.param<double>("dock_pose_timeout",    dock_timeout_,    5.0);
+    pnh_.param<double>("path_publish_rate",    publish_rate_,    2.0);
+
+    // Costmap lethal threshold (0-100). Cells >= this are in collision.
+    pnh_.param<int>("costmap_lethal_thresh",   lethal_thresh_,   90);
+
+    dock_sub_ = nh_.subscribe("/dock_pose", 5,
+                              &DockApproachPlanner::dockPoseCb, this);
+    map_sub_  = nh_.subscribe("/inflated_map", 1,
+                              &DockApproachPlanner::mapCb, this);
+    path_pub_   = nh_.advertise<nav_msgs::Path>("simple_dubins_path", 5, true);
+    docked_pub_ = nh_.advertise<std_msgs::Bool>("docking/docked", 5, true);
+
+    ROS_INFO("[DockApproachPlanner] Ready.");
+    ROS_INFO("  berth_side         = %s",     berth_side_.c_str());
+    ROS_INFO("  gate_lateral_offset= %.1f m", gate_lateral_);
+    ROS_INFO("  gate_standoff      = %.1f m", gate_standoff_);
+    ROS_INFO("  berth_standoff     = %.1f m", berth_standoff_);
+    ROS_INFO("  start_delay        = %.1f s", start_delay_);
+
+    ros::Rate rate(publish_rate_);
+    while (nh_.ok())
+    {
+      update();
+      ros::spinOnce();
+      rate.sleep();
+    }
+  }
+
+private:
+  enum State { WAITING, APPROACHING, BERTHING, DOCKED };
+
+  // -----------------------------------------------------------------------
+  void mapCb(const nav_msgs::OccupancyGrid::ConstPtr& msg)
+  {
+    map_      = *msg;
+    have_map_ = true;
+  }
+
+  // -----------------------------------------------------------------------
+  void dockPoseCb(const geometry_msgs::PoseStamped::ConstPtr& msg)
+  {
+    geometry_msgs::PoseStamped in_map = *msg;
+    if (msg->header.frame_id != map_frame_)
+    {
+      try {
+        tf_buffer_.transform(*msg, in_map, map_frame_, ros::Duration(0.1));
+      } catch (tf2::TransformException& ex) {
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] TF: %s", ex.what());
+        return;
+      }
+    }
+    if (!dock_received_)
+    {
+      first_dock_time_ = ros::Time::now();
+      dock_received_   = true;
+      ROS_INFO("[DockApproachPlanner] First dock pose — waiting %.1f s.", start_delay_);
+    }
+    dock_pose_     = in_map;
+    last_dock_time_= ros::Time::now();
+  }
+
+  // -----------------------------------------------------------------------
+  bool getRobotPose(double& rx, double& ry, double& ryaw)
+  {
+    geometry_msgs::TransformStamped tf;
+    try {
+      tf = tf_buffer_.lookupTransform(map_frame_, "base_link",
+                                      ros::Time(0), ros::Duration(0.0));
+    } catch (tf2::TransformException& ex) {
+      ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] TF base_link: %s", ex.what());
+      return false;
+    }
+    rx   = tf.transform.translation.x;
+    ry   = tf.transform.translation.y;
+    ryaw = tf2::getYaw(tf.transform.rotation);
+    return true;
+  }
+
+  // -----------------------------------------------------------------------
+  // Check if a world point (wx, wy) is in collision on the inflated map.
+  // Returns true if occupied / unknown / outside map.
+  bool inCollision(double wx, double wy) const
+  {
+    if (!have_map_) return false;
+    const auto& info = map_.info;
+    int mx = (int)((wx - info.origin.position.x) / info.resolution);
+    int my = (int)((wy - info.origin.position.y) / info.resolution);
+    if (mx < 0 || my < 0 || mx >= (int)info.width || my >= (int)info.height)
+      return true;  // outside map = treat as occupied
+    int idx = my * info.width + mx;
+    int8_t cost = map_.data[idx];
+    return (cost < 0 || cost >= lethal_thresh_);  // -1=unknown, >=thresh=occupied
+  }
+
+  // Check all points on a path segment for collision.
+  bool pathInCollision(double x0, double y0, double x1, double y1) const
+  {
+    double dx   = x1 - x0, dy = y1 - y0;
+    double dist = std::hypot(dx, dy);
+    int    steps = std::max(2, (int)(dist / 0.2));
+    for (int i = 0; i <= steps; ++i)
+    {
+      double f = (double)i / steps;
+      if (inCollision(x0 + f*dx, y0 + f*dy)) return true;
+    }
+    return false;
+  }
+
+  // -----------------------------------------------------------------------
+  // Compute gate and berth from dock pose.
+  //
+  // dock_yaw  = inward face normal (into dock)
+  // owd       = dock_yaw + PI  = open water direction
+  // long_axis = owd ± 90°      = along dock face
+  //
+  // Gate is placed LATERALLY off the dock — along the long axis,
+  // backed off by gate_standoff in the open water direction.
+  // The boat approaches from the side, not the front.
+  //
+  void computeGeometry(double& gate_x,  double& gate_y,
+                       double& berth_x, double& berth_y,
+                       double& berth_heading)
+  {
+    double dock_yaw = tf2::getYaw(dock_pose_.pose.orientation);
+    double cx = dock_pose_.pose.position.x;
+    double cy = dock_pose_.pose.position.y;
+
+    // open water direction
+    double owd = wrapAngle(dock_yaw + M_PI);
+
+    // long axis direction: perpendicular to dock face normal
+    // port = left when facing open water (+90° from owd)
+    // starboard = right (-90° from owd)
+    double side_sign = (berth_side_ == "port") ? 1.0 : -1.0;
+    double long_yaw  = wrapAngle(owd + side_sign * M_PI_2);
+
+    // unit vectors
+    double owx = std::cos(owd),      owy = std::sin(owd);
+    double lx  = std::cos(long_yaw), ly  = std::sin(long_yaw);
+
+    // Gate: lateral along dock + standoff into open water
+    // The boat comes FROM the gate_lateral side, so the gate is
+    // gate_lateral metres along the long axis away from the dock centre
+    gate_x = cx + gate_lateral_ * lx + gate_standoff_ * owx;
+    gate_y = cy + gate_lateral_ * ly + gate_standoff_ * owy;
+
+    // Berth: close to dock face, offset along long axis
+    berth_x = cx + berth_long_ * lx + berth_standoff_ * owx;
+    berth_y = cy + berth_long_ * ly + berth_standoff_ * owy;
+
+    // At berth bow faces open water (stern toward dock)
+    // The boat comes from the gate side (positive long_yaw direction)
+    // and after the U-turn its bow points back along -long_yaw = open water side
+    berth_heading = wrapAngle(long_yaw + M_PI);
+
+    ROS_INFO_THROTTLE(2.0,
+      "[DockApproachPlanner] dock=(%.1f,%.1f) yaw=%.1fdeg  owd=%.1fdeg  long=%.1fdeg  side=%s",
+      cx, cy, dock_yaw*180/M_PI, owd*180/M_PI, long_yaw*180/M_PI, berth_side_.c_str());
+    ROS_INFO_THROTTLE(2.0,
+      "[DockApproachPlanner] gate=(%.1f,%.1f)  berth=(%.1f,%.1f)  berth_hdg=%.1fdeg",
+      gate_x, gate_y, berth_x, berth_y, berth_heading*180/M_PI);
+
+    // Collision check
+    if (have_map_)
+    {
+      if (pathInCollision(gate_x, gate_y, berth_x, berth_y))
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] WARNING: berth path is in collision on inflated map!");
+      if (inCollision(gate_x, gate_y))
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] WARNING: gate point is in collision!");
+      if (inCollision(berth_x, berth_y))
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] WARNING: berth point is in collision!");
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  void publishEmpty()
+  {
+    nav_msgs::Path empty;
+    empty.header.frame_id = map_frame_;
+    empty.header.stamp    = ros::Time::now();
+    path_pub_.publish(empty);
+  }
+
+  // -----------------------------------------------------------------------
+  void update()
+  {
+    if (!dock_received_) return;
+
+    if (state_ == WAITING)
+    {
+      double elapsed = (ros::Time::now() - first_dock_time_).toSec();
+      ROS_INFO_THROTTLE(2.0, "[DockApproachPlanner] WAITING %.1f/%.1f s",
+                        elapsed, start_delay_);
+      if (elapsed >= start_delay_)
+      {
+        ROS_INFO("[DockApproachPlanner] Starting APPROACHING.");
+        state_ = APPROACHING;
+      }
+      return;
+    }
+
+    if ((ros::Time::now() - last_dock_time_).toSec() > dock_timeout_)
+    {
+      ROS_WARN_THROTTLE(3.0, "[DockApproachPlanner] Dock pose stale.");
+      return;
+    }
+
+    double rx, ry, ryaw;
+    if (!getRobotPose(rx, ry, ryaw)) return;
+
+    double gate_x, gate_y, berth_x, berth_y, berth_heading;
+    computeGeometry(gate_x, gate_y, berth_x, berth_y, berth_heading);
+
+    double dist_to_gate  = std::hypot(rx - gate_x,  ry - gate_y);
+    double dist_to_berth = std::hypot(rx - berth_x, ry - berth_y);
+
+    switch (state_)
+    {
+      // ── APPROACHING ──────────────────────────────────────────────────────
+      // Drive to gate point. Path yaw blends to berth_heading so boat is
+      // already rotating into the U-turn before it arrives.
+      case APPROACHING:
+      {
+        // Check approach path for collision and warn
+        if (have_map_ && pathInCollision(rx, ry, gate_x, gate_y))
+          ROS_WARN_THROTTLE(1.0, "[DockApproachPlanner] Approach path in collision!");
+
+        nav_msgs::Path p = straightPath(map_frame_,
+                                        rx, ry, gate_x, gate_y,
+                                        berth_heading, 0.6);
+        path_pub_.publish(p);
+
+        ROS_INFO_THROTTLE(2.0,
+          "[DockApproachPlanner] APPROACHING gate (%.1f,%.1f) dist=%.1f m",
+          gate_x, gate_y, dist_to_gate);
+
+        if (dist_to_gate < switch_radius_)
+        {
+          ROS_INFO("[DockApproachPlanner] At gate — BERTHING.");
+          state_ = BERTHING;
+        }
+        break;
+      }
+
+      // ── BERTHING ──────────────────────────────────────────────────────────
+      // Short run parallel to dock face from gate to berth point.
+      case BERTHING:
+      {
+        nav_msgs::Path p = straightPath(map_frame_,
+                                        rx, ry, berth_x, berth_y,
+                                        berth_heading, 0.15);
+        path_pub_.publish(p);
+
+        ROS_INFO_THROTTLE(1.0,
+          "[DockApproachPlanner] BERTHING (%.1f,%.1f) dist=%.1f m",
+          berth_x, berth_y, dist_to_berth);
+
+        if (dist_to_berth < goal_tolerance_)
+        {
+          ROS_INFO("[DockApproachPlanner] *** DOCKED ***");
+          state_ = DOCKED;
+          publishEmpty();
+          std_msgs::Bool msg;
+          msg.data = true;
+          docked_pub_.publish(msg);
+        }
+        break;
+      }
+
+      case DOCKED:
+        publishEmpty();
+        break;
+
+      default: break;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  ros::NodeHandle nh_, pnh_;
+  ros::Subscriber dock_sub_;
+  ros::Subscriber map_sub_;
+  ros::Publisher  path_pub_;
+  ros::Publisher  docked_pub_;
+
+  tf2_ros::Buffer            tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
+
+  geometry_msgs::PoseStamped dock_pose_;
+  nav_msgs::OccupancyGrid    map_;
+  bool have_map_;
+  bool dock_received_ = false;
+  ros::Time first_dock_time_;
+  ros::Time last_dock_time_;
+
+  State state_;
+
+  std::string map_frame_;
+  double start_delay_;
+  double gate_lateral_;
+  double gate_standoff_;
+  std::string berth_side_;
+  double berth_standoff_;
+  double berth_long_;
+  double switch_radius_;
+  double goal_tolerance_;
+  double dock_timeout_;
+  double publish_rate_;
+  int    lethal_thresh_;
+};
+
+// -------------------------------------------------------------------------
+int main(int argc, char** argv)
+{
+  ros::init(argc, argv, "dock_approach_planner");
+  DockApproachPlanner node;
+  return 0;
+}
+
+
+// dock_approach_planner.cpp
+//
+// Geometry (dock_pose yaw = inward face normal, INTO the dock):
+//
+//         dock long axis
+//         <----------->
+//    ____________________
+//   |                    |  <- dock face (open water side)
+//   |____________________|
+//              |
+//           dock_yaw (points INTO dock)
+//              |
+//        open_water_dir = dock_yaw + PI
+//
+//  The berth is ALONGSIDE the dock (parallel to long axis).
+//  Gate point = purely lateral offset from dock centre along long axis,
+//               then backed off into open water. NOT along dock_yaw at all.
+//
+//  Steps:
+//   1. WAITING   — wait start_delay seconds for dock lock to settle
+//   2. APPROACHING — drive to gate point (lateral of dock in open water)
+//                    path yaw blends to berth_heading (parallel to dock)
+//   3. BERTHING  — drive from gate alongside dock face to berth point
+//   4. DOCKED    — stop
+//
+//  Costmap: subscribes to /inflated_map, checks each path point against
+//           the occupancy grid and warns if path is in collision.
+
+#include <ros/ros.h>
+#include <nav_msgs/Path.h>
+#include <nav_msgs/OccupancyGrid.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <std_msgs/Bool.h>
+
+#include <tf2_ros/transform_listener.h>
+#include <tf2/utils.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2/LinearMath/Quaternion.h>
+
+#include <cmath>
+#include <string>
+#include <vector>
+
+static double wrapAngle(double a)
+{
+  while (a >  M_PI) a -= 2.0 * M_PI;
+  while (a < -M_PI) a += 2.0 * M_PI;
+  return a;
+}
+
+static geometry_msgs::PoseStamped makePose(const std::string& frame,
+                                           double x, double y, double yaw)
+{
+  geometry_msgs::PoseStamped ps;
+  ps.header.frame_id = frame;
+  ps.header.stamp    = ros::Time::now();
+  ps.pose.position.x = x;
+  ps.pose.position.y = y;
+  ps.pose.position.z = 0.0;
+  tf2::Quaternion q;
+  q.setRPY(0.0, 0.0, yaw);
+  ps.pose.orientation = tf2::toMsg(q);
+  return ps;
+}
+
+// Straight-line path from (x0,y0) to (x1,y1).
+// Yaw blends from travel direction to arrival_yaw over the last blend_frac.
+static nav_msgs::Path straightPath(const std::string& frame,
+                                   double x0, double y0,
+                                   double x1, double y1,
+                                   double arrival_yaw,
+                                   double blend_frac = 0.5)
+{
+  nav_msgs::Path path;
+  path.header.frame_id = frame;
+  path.header.stamp    = ros::Time::now();
+
+  double dx       = x1 - x0;
+  double dy       = y1 - y0;
+  double dist     = std::hypot(dx, dy);
+  double trav_yaw = std::atan2(dy, dx);
+
+  const double RES = 0.10;
+  int steps = std::max(2, (int)(dist / RES));
+
+  for (int i = 0; i <= steps; ++i)
+  {
+    double frac = (double)i / (double)steps;
+    double yaw;
+    if (frac < (1.0 - blend_frac))
+      yaw = trav_yaw;
+    else
+    {
+      double t    = (frac - (1.0 - blend_frac)) / blend_frac;
+      double dyaw = wrapAngle(arrival_yaw - trav_yaw);
+      yaw = wrapAngle(trav_yaw + t * dyaw);
+    }
+    path.poses.push_back(makePose(frame, x0 + frac*dx, y0 + frac*dy, yaw));
+  }
+  return path;
+}
+
+// -------------------------------------------------------------------------
+class DockApproachPlanner
+{
+public:
+  DockApproachPlanner() : nh_(), pnh_("~"), tf_listener_(tf_buffer_),
+                          state_(WAITING), dock_received_(false),
+                          have_map_(false)
+  {
+    pnh_.param<std::string>("map_frame",       map_frame_,       "map");
+    pnh_.param<double>("start_delay",          start_delay_,     8.0);
+
+    // How far out from the dock ALONG THE LONG AXIS to place the gate.
+    // This is the lateral distance — boat comes from the side, not the front.
+    pnh_.param<double>("gate_lateral_offset",  gate_lateral_,    12.0); // m along long axis
+
+    // How far off the dock FACE (open water direction) the gate sits.
+    // Gives clearance from the dock end.
+    pnh_.param<double>("gate_standoff",        gate_standoff_,   6.0);  // m off dock face
+
+    // Which side of the dock long axis to berth on.
+    // "port" = +90° from open_water_dir, "starboard" = -90°
+    pnh_.param<std::string>("berth_side",      berth_side_,      "port");
+
+    // How far off the dock face at the berth (m).
+    pnh_.param<double>("berth_standoff",       berth_standoff_,  1.5);
+
+    // Where along the dock long axis to berth (0 = dock centre).
+    // Positive = toward berth_side gate direction.
+    pnh_.param<double>("berth_long_offset",    berth_long_,      0.0);
+
+    pnh_.param<double>("switch_radius",        switch_radius_,   2.5);
+    pnh_.param<double>("goal_tolerance",       goal_tolerance_,  1.2);
+    pnh_.param<double>("dock_pose_timeout",    dock_timeout_,    5.0);
+    pnh_.param<double>("path_publish_rate",    publish_rate_,    2.0);
+
+    // Costmap lethal threshold (0-100). Cells >= this are in collision.
+    pnh_.param<int>("costmap_lethal_thresh",   lethal_thresh_,   90);
+
+    dock_sub_ = nh_.subscribe("/dock_pose", 5,
+                              &DockApproachPlanner::dockPoseCb, this);
+    map_sub_  = nh_.subscribe("/inflated_map", 1,
+                              &DockApproachPlanner::mapCb, this);
+    path_pub_   = nh_.advertise<nav_msgs::Path>("simple_dubins_path", 5, true);
+    docked_pub_ = nh_.advertise<std_msgs::Bool>("docking/docked", 5, true);
+
+    ROS_INFO("[DockApproachPlanner] Ready.");
+    ROS_INFO("  berth_side         = %s",     berth_side_.c_str());
+    ROS_INFO("  gate_lateral_offset= %.1f m", gate_lateral_);
+    ROS_INFO("  gate_standoff      = %.1f m", gate_standoff_);
+    ROS_INFO("  berth_standoff     = %.1f m", berth_standoff_);
+    ROS_INFO("  start_delay        = %.1f s", start_delay_);
+
+    ros::Rate rate(publish_rate_);
+    while (nh_.ok())
+    {
+      update();
+      ros::spinOnce();
+      rate.sleep();
+    }
+  }
+
+private:
+  enum State { WAITING, APPROACHING, BERTHING, DOCKED };
+
+  // -----------------------------------------------------------------------
+  void mapCb(const nav_msgs::OccupancyGrid::ConstPtr& msg)
+  {
+    map_      = *msg;
+    have_map_ = true;
+  }
+
+  // -----------------------------------------------------------------------
+  void dockPoseCb(const geometry_msgs::PoseStamped::ConstPtr& msg)
+  {
+    geometry_msgs::PoseStamped in_map = *msg;
+    if (msg->header.frame_id != map_frame_)
+    {
+      try {
+        tf_buffer_.transform(*msg, in_map, map_frame_, ros::Duration(0.1));
+      } catch (tf2::TransformException& ex) {
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] TF: %s", ex.what());
+        return;
+      }
+    }
+    if (!dock_received_)
+    {
+      first_dock_time_ = ros::Time::now();
+      dock_received_   = true;
+      ROS_INFO("[DockApproachPlanner] First dock pose — waiting %.1f s.", start_delay_);
+    }
+    dock_pose_     = in_map;
+    last_dock_time_= ros::Time::now();
+  }
+
+  // -----------------------------------------------------------------------
+  bool getRobotPose(double& rx, double& ry, double& ryaw)
+  {
+    geometry_msgs::TransformStamped tf;
+    try {
+      tf = tf_buffer_.lookupTransform(map_frame_, "base_link",
+                                      ros::Time(0), ros::Duration(0.0));
+    } catch (tf2::TransformException& ex) {
+      ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] TF base_link: %s", ex.what());
+      return false;
+    }
+    rx   = tf.transform.translation.x;
+    ry   = tf.transform.translation.y;
+    ryaw = tf2::getYaw(tf.transform.rotation);
+    return true;
+  }
+
+  // -----------------------------------------------------------------------
+  // Check if a world point (wx, wy) is in collision on the inflated map.
+  // Returns true if occupied / unknown / outside map.
+  bool inCollision(double wx, double wy) const
+  {
+    if (!have_map_) return false;
+    const auto& info = map_.info;
+    int mx = (int)((wx - info.origin.position.x) / info.resolution);
+    int my = (int)((wy - info.origin.position.y) / info.resolution);
+    if (mx < 0 || my < 0 || mx >= (int)info.width || my >= (int)info.height)
+      return true;  // outside map = treat as occupied
+    int idx = my * info.width + mx;
+    int8_t cost = map_.data[idx];
+    return (cost < 0 || cost >= lethal_thresh_);  // -1=unknown, >=thresh=occupied
+  }
+
+  // Check all points on a path segment for collision.
+  bool pathInCollision(double x0, double y0, double x1, double y1) const
+  {
+    double dx   = x1 - x0, dy = y1 - y0;
+    double dist = std::hypot(dx, dy);
+    int    steps = std::max(2, (int)(dist / 0.2));
+    for (int i = 0; i <= steps; ++i)
+    {
+      double f = (double)i / steps;
+      if (inCollision(x0 + f*dx, y0 + f*dy)) return true;
+    }
+    return false;
+  }
+
+  // -----------------------------------------------------------------------
+  // Compute gate and berth from dock pose.
+  //
+  // dock_yaw  = inward face normal (into dock)
+  // owd       = dock_yaw + PI  = open water direction
+  // long_axis = owd ± 90°      = along dock face
+  //
+  // Gate is placed LATERALLY off the dock — along the long axis,
+  // backed off by gate_standoff in the open water direction.
+  // The boat approaches from the side, not the front.
+  //
+  void computeGeometry(double& gate_x,  double& gate_y,
+                       double& berth_x, double& berth_y,
+                       double& berth_heading)
+  {
+    double dock_yaw = tf2::getYaw(dock_pose_.pose.orientation);
+    double cx       = dock_pose_.pose.position.x;
+    double cy       = dock_pose_.pose.position.y;
+    // z encodes half the dock bounding-box width (centroid to open-water face)
+    double half_w   = dock_pose_.pose.position.z;
+
+    // Open water direction (away from dock face)
+    double owd = wrapAngle(dock_yaw + M_PI);
+
+    // Long axis: perpendicular to face normal
+    // port=+90 from owd, starboard=-90 from owd
+    double side_sign = (berth_side_ == "port") ? 1.0 : -1.0;
+    double long_yaw  = wrapAngle(owd + side_sign * M_PI_2);
+
+    // Unit vectors
+    double owx = std::cos(owd),       owy = std::sin(owd);
+    double lx  = std::cos(long_yaw),  ly  = std::sin(long_yaw);
+
+    // Dock face = centroid shifted by half_w toward open water
+    double face_x = cx + half_w * owx;
+    double face_y = cy + half_w * owy;
+
+    // Gate: beyond the dock end in open water
+    // gate_lateral  = how far along dock long axis past the end
+    // gate_standoff = how far into open water from the face
+    gate_x = face_x + gate_lateral_ * lx + gate_standoff_ * owx;
+    gate_y = face_y + gate_lateral_ * ly + gate_standoff_ * owy;
+
+    // Berth: alongside the dock face, berth_standoff off the face
+    // berth_long_ shifts along the dock axis (0 = opposite dock centre)
+    berth_x = face_x + berth_standoff_ * owx + berth_long_ * lx;
+    berth_y = face_y + berth_standoff_ * owy + berth_long_ * ly;
+
+    // Bow faces open water after U-turn (stern toward dock)
+    berth_heading = wrapAngle(long_yaw + M_PI);
+
+    ROS_INFO_THROTTLE(2.0,
+      "[DockApproachPlanner] dock=(%.1f,%.1f) yaw=%.1fdeg half_w=%.1f  owd=%.1fdeg  long=%.1fdeg  side=%s",
+      cx, cy, dock_yaw*180/M_PI, half_w, owd*180/M_PI, long_yaw*180/M_PI, berth_side_.c_str());
+    ROS_INFO_THROTTLE(2.0,
+      "[DockApproachPlanner] face=(%.1f,%.1f) gate=(%.1f,%.1f)  berth=(%.1f,%.1f)  berth_hdg=%.1fdeg",
+      face_x, face_y, gate_x, gate_y, berth_x, berth_y, berth_heading*180/M_PI);
+
+    if (have_map_)
+    {
+      if (pathInCollision(gate_x, gate_y, berth_x, berth_y))
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] WARNING: berth path in collision!");
+      if (inCollision(gate_x, gate_y))
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] WARNING: gate point in collision!");
+      if (inCollision(berth_x, berth_y))
+        ROS_WARN_THROTTLE(2.0, "[DockApproachPlanner] WARNING: berth point in collision!");
+    }
+  }
+
+  void publishEmpty()
+  {
+    nav_msgs::Path empty;
+    empty.header.frame_id = map_frame_;
+    empty.header.stamp    = ros::Time::now();
+    path_pub_.publish(empty);
+  }
+
+  // -----------------------------------------------------------------------
+  void update()
+  {
+    if (!dock_received_) return;
+
+    if (state_ == WAITING)
+    {
+      double elapsed = (ros::Time::now() - first_dock_time_).toSec();
+      ROS_INFO_THROTTLE(2.0, "[DockApproachPlanner] WAITING %.1f/%.1f s",
+                        elapsed, start_delay_);
+      if (elapsed >= start_delay_)
+      {
+        ROS_INFO("[DockApproachPlanner] Starting APPROACHING.");
+        state_ = APPROACHING;
+      }
+      return;
+    }
+
+    if ((ros::Time::now() - last_dock_time_).toSec() > dock_timeout_)
+    {
+      ROS_WARN_THROTTLE(3.0, "[DockApproachPlanner] Dock pose stale.");
+      return;
+    }
+
+    double rx, ry, ryaw;
+    if (!getRobotPose(rx, ry, ryaw)) return;
+
+    double gate_x, gate_y, berth_x, berth_y, berth_heading;
+    computeGeometry(gate_x, gate_y, berth_x, berth_y, berth_heading);
+
+    double dist_to_gate  = std::hypot(rx - gate_x,  ry - gate_y);
+    double dist_to_berth = std::hypot(rx - berth_x, ry - berth_y);
+
+    switch (state_)
+    {
+      // ── APPROACHING ──────────────────────────────────────────────────────
+      // Drive to gate point. Path yaw blends to berth_heading so boat is
+      // already rotating into the U-turn before it arrives.
+      case APPROACHING:
+      {
+        // Check approach path for collision and warn
+        if (have_map_ && pathInCollision(rx, ry, gate_x, gate_y))
+          ROS_WARN_THROTTLE(1.0, "[DockApproachPlanner] Approach path in collision!");
+
+        nav_msgs::Path p = straightPath(map_frame_,
+                                        rx, ry, gate_x, gate_y,
+                                        berth_heading, 0.6);
+        path_pub_.publish(p);
+
+        ROS_INFO_THROTTLE(2.0,
+          "[DockApproachPlanner] APPROACHING gate (%.1f,%.1f) dist=%.1f m",
+          gate_x, gate_y, dist_to_gate);
+
+        if (dist_to_gate < switch_radius_)
+        {
+          ROS_INFO("[DockApproachPlanner] At gate — BERTHING.");
+          state_ = BERTHING;
+        }
+        break;
+      }
+
+      // ── BERTHING ──────────────────────────────────────────────────────────
+      // Short run parallel to dock face from gate to berth point.
+      case BERTHING:
+      {
+        nav_msgs::Path p = straightPath(map_frame_,
+                                        rx, ry, berth_x, berth_y,
+                                        berth_heading, 0.15);
+        path_pub_.publish(p);
+
+        ROS_INFO_THROTTLE(1.0,
+          "[DockApproachPlanner] BERTHING (%.1f,%.1f) dist=%.1f m",
+          berth_x, berth_y, dist_to_berth);
+
+        if (dist_to_berth < goal_tolerance_)
+        {
+          ROS_INFO("[DockApproachPlanner] *** DOCKED ***");
+          state_ = DOCKED;
+          publishEmpty();
+          std_msgs::Bool msg;
+          msg.data = true;
+          docked_pub_.publish(msg);
+        }
+        break;
+      }
+
+      case DOCKED:
+        publishEmpty();
+        break;
+
+      default: break;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  ros::NodeHandle nh_, pnh_;
+  ros::Subscriber dock_sub_;
+  ros::Subscriber map_sub_;
+  ros::Publisher  path_pub_;
+  ros::Publisher  docked_pub_;
+
+  tf2_ros::Buffer            tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
+
+  geometry_msgs::PoseStamped dock_pose_;
+  nav_msgs::OccupancyGrid    map_;
+  bool have_map_;
+  bool dock_received_ = false;
+  ros::Time first_dock_time_;
+  ros::Time last_dock_time_;
+
+  State state_;
+
+  std::string map_frame_;
+  double start_delay_;
+  double gate_lateral_;
+  double gate_standoff_;
+  std::string berth_side_;
+  double berth_standoff_;
+  double berth_long_;
+  double switch_radius_;
+  double goal_tolerance_;
+  double dock_timeout_;
+  double publish_rate_;
+  int    lethal_thresh_;
+};
+
+// -------------------------------------------------------------------------
+int main(int argc, char** argv)
+{
+  ros::init(argc, argv, "dock_approach_planner");
+  DockApproachPlanner node;
+  return 0;
+}
+
+
+

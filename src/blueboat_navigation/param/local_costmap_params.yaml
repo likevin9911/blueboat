@@ -1,0 +1,32 @@
+local_costmap:
+  global_frame: odom
+  robot_base_frame: base_link
+  footprint: [[0.60, 0.45], [0.60, -0.45], [-0.60, -0.45], [-0.60, 0.45]]
+  footprint_padding: 0.1
+  update_frequency: 10.0
+  publish_frequency: 5.0
+  static_map: false
+  rolling_window: true
+  width: 50
+  height: 50
+  resolution: 0.1
+  transform_tolerance: 0.3
+  
+  plugins:
+   - name: obstacle_layer
+     type: "costmap_2d::ObstacleLayer"
+     footprint_clearing_enabled: true  # <--- ADD THIS
+     clearing: true                    # <--- ENSURE THIS IS TRUE
+     marking: true
+     # You likely have observation_sources defined here, ensure they have clearing: true as well
+     observation_sources: scan
+     scan:
+       data_type: LaserScan
+       topic: lidar/scan
+       marking: true
+       clearing: true
+       min_obstacle_height: 0.0
+       max_obstacle_height: 2.0        # Adjust based on your pole height if using 3D lidar projected to 2D
+
+   - name: inflation_layer
+     type: "costmap_2d::InflationLayer"

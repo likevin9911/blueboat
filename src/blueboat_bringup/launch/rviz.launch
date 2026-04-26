@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<launch>
+
+  <!-- RViz Toggle: Set to true to launch, false to disable -->
+  <arg name="rviz" default="true" />
+  <arg name="rviz_config" default="$(find blueboat_bringup)/rviz/launch.rviz" />
+
+  <group if="$(arg rviz)">
+    <node
+      pkg="rviz" type="rviz" name="blueboat_viz" args="-d $(arg rviz_config)" output="screen"/>
+  </group>
+
+</launch>
