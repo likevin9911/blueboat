@@ -38,7 +38,7 @@
   <arg name="z" default="0.1" />
   <arg name="R" default="0" />
   <arg name="P" default="0" />
-  <arg name="Y" default="1.649" />
+  <arg name="Y" default="0" />
   
 
   <arg name="locked" default="false" />

@@ -277,6 +277,7 @@ void Guidance::followPath(double x, double y, double psi)
   {
     double frac = static_cast<double>(remaining) / kSlowdownPoses;
     u *= frac;
+    u = std::max(u, 0.15);
   }
   else
   {
@@ -318,15 +319,28 @@ void Guidance::stationKeep(double x, double y, double psi,
   double dy = goal.pose.position.y - y;
   double dist = std::hypot(dx, dy);
 
-  // Inner deadzone: we're close enough, just hold orientation. This
-  // prevents "creep + correct + creep" oscillation around the goal.
-  const double deadzone = 0.3;  // meters
+  const double deadzone     = 0.05;  // meters — position tolerance
+  const double yawTolerance = 3.0 * M_PI / 180.0;  // 3 deg — final yaw tolerance
+
+  // Inside position deadzone: rotate in place to match the goal pose's yaw.
+  // The controller's surge PID with speed=0 will hold the boat near the goal
+  // while the yaw PID drives heading to goalYaw.
   if (dist < deadzone)
   {
+    double goalYaw = tf2::getYaw(goal.pose.orientation);
+    double yawErr  = goalYaw - psi;
+    while (yawErr >  M_PI) yawErr -= 2 * M_PI;
+    while (yawErr < -M_PI) yawErr += 2 * M_PI;
+
     usv_msgs::SpeedCourse msg;
     msg.speed  = 0.0;
-    msg.course = tf2::getYaw(goal.pose.orientation);
+    msg.course = goalYaw;
     m_controllerPub.publish(msg);
+
+    ROS_INFO_STREAM_THROTTLE(1.0,
+        "[guidance] station-keep: at goal, yaw_err="
+        << yawErr * 180.0 / M_PI << " deg"
+        << (std::fabs(yawErr) < yawTolerance ? " [SETTLED]" : ""));
     return;
   }
 
@@ -346,7 +360,7 @@ void Guidance::stationKeep(double x, double y, double psi,
   while (cmdHeading >  M_PI) cmdHeading -= 2 * M_PI;
   while (cmdHeading < -M_PI) cmdHeading += 2 * M_PI;
 
-  double creep = std::min(0.3, 0.4 * dist);   // cap at 0.3 m/s
+  double creep = std::min(0.3, 0.4 * dist);
   if (useReverse) creep = -creep;
 
   usv_msgs::SpeedCourse msg;

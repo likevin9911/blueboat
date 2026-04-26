@@ -228,7 +228,7 @@
   <node name="BlueboatController" pkg="blueboat_control" type="controller">
     <param name="Kp_psi"   value="4.0"/>
     <param name="Kd_psi"   value="4.0"/>
-    <param name="Ki_psi"   value="1.0"/>
+    <param name="Ki_psi"   value="0.05"/>
     <param name="mass_psi" value="9.0"/>
     <param name="damp_psi" value="20.0"/>
     <param name="Kp_u"     value="2.0"/>

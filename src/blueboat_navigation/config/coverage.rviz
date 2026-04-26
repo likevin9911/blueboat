@@ -6,6 +6,9 @@ Panels:
       Expanded:
         - /SLAMTrajectory1
         - /CoveredWaypoints1
+        - /TF1
+        - /TF1/Frames1
+        - /TF1/Tree1
         - /DubinsPath1
         - /GroundTruthOdom1/Shape1
         - /MarkerArray1
@@ -68,8 +71,9 @@ Visualization Manager:
         All Submap Pose Markers: true
         Trajectory 0:
           0.50: true
-          1.29: true
-          2.4: true
+          1.50: true
+          2.50: true
+          3.25: true
           Submap Pose Markers: true
           Value: true
       Topic: /submap_list
@@ -126,25 +130,25 @@ Visualization Manager:
       Frames:
         All Enabled: false
         base_link:
-          Value: false
+          Value: true
         dummy_link:
-          Value: true
+          Value: false
         front_camera_link:
-          Value: true
+          Value: false
         front_camera_link_optical:
-          Value: true
+          Value: false
         gps_blueboat_link:
-          Value: true
+          Value: false
         imu_blueboat_link:
-          Value: true
+          Value: false
         left_propeller_link:
           Value: false
         lidar_blueboat_link:
-          Value: true
-        map:
           Value: false
-        payload_link:
+        map:
           Value: true
+        payload_link:
+          Value: false
         right_propeller_link:
           Value: false
       Marker Alpha: 1
@@ -390,7 +394,7 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 17.6247501373291
+      Scale: 26.169647216796875
       Target Frame: lidar_link
       X: 0
       Y: 0
@@ -411,5 +415,5 @@ Window Geometry:
   Views:
     collapsed: true
   Width: 1048
-  X: 2080
-  Y: 27
+  X: 2792
+  Y: 104

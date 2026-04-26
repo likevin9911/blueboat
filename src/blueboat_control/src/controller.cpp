@@ -144,9 +144,11 @@ double BlueboatController::calculateYawMoment(double deltaTime,
   while (psi_tilde >  M_PI) psi_tilde -= 2 * M_PI;
   while (psi_tilde < -M_PI) psi_tilde += 2 * M_PI;
 
-  // Yaw integrator left disabled (matches your prior code; re-enable with
-  // anti-windup if you want steady-state heading correction in current).
-  // integralTerm += psi_tilde * deltaTime;
+  // Integrate with clamp to prevent windup.
+  integralTerm += psi_tilde * deltaTime;
+  const double iMax = 2.0;  // tune: rad·s
+  if      (integralTerm >  iMax) integralTerm =  iMax;
+  else if (integralTerm < -iMax) integralTerm = -iMax;
 
   return mass_psi * (r_d_dot - Kd_psi * r_tilde
                               - Kp_psi * psi_tilde

@@ -90,7 +90,7 @@
     
     <!-- Add Simulated IMU -->
     <xacro:if value="$(arg imu_enabled)">
-      <xacro:blueboat_imu name="imu_blueboat" x="0" y="0" z="0.25" />
+      <xacro:blueboat_imu name="imu_blueboat" x="0" y="0" z="0" />
     </xacro:if>
     
     <!-- Add 3D LIDAR -->

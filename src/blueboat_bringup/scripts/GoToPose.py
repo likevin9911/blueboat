@@ -45,15 +45,15 @@ from usv_msgs.msg import SpeedCourse
 DEFAULT_X      = 22.36
 DEFAULT_Y      = -3.70
 DEFAULT_YAW    = 0.0          # degrees
-DEFAULT_OUTPUT = "run1.csv"
+DEFAULT_OUTPUT = "GoToPoseTask3.csv"
 TIMEOUT        = 60.0         # seconds — hard cap if arrival never happens
 RECORD_HZ      = 10.0
 
 # Arrival tolerances. Position is loose enough to be achievable in current/
 # wind; yaw is reasonably tight so "aligned" actually means aligned. Bump
 # yaw_tol up if the boat can't ever satisfy it (open-loop yaw after arrival).
-POSITION_TOL_M     = 0.8      # meters
-YAW_TOL_DEG        = 15.0     # degrees
+POSITION_TOL_M     = 0.1      # meters
+YAW_TOL_DEG        = 10.0     # degrees
 GRACE_AFTER_ARRIVAL = 10.0    # seconds of recording after arrival latch
 
 GOAL_FRAME     = "map"
