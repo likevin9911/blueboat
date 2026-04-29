@@ -1,0 +1,122 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- =====================================================================
+       Dock perception + Python task launch.
+
+       Replaces the C++ dock_approach_planner with the Python GoToDock.py
+       task. Adaptive clustering and L-shape fitting stay in C++ (perf).
+
+       This launch file is INCLUDED by your top-level navigation launch
+       (which already brings up sim, mapping, RPP guidance, controller,
+       and search/steering planners). Run this AFTER the main stack is up.
+       Or wrap it inside the main launch file under a "task=dock" arg.
+       ===================================================================== -->
+
+  <!-- Perception arguments (same as your old launch) -->
+  <arg name="pointcloud_topic"  default="/lidar_blueboat/points"/>
+  <arg name="target_frame"      default="map"/>
+  <arg name="sensor_model"      default="HDL-32E"/>
+  <arg name="criterion"         default="CLOSENESS"/>
+  <arg name="min_dock_length"   default="8.0"/>
+  <arg name="max_dock_length"   default="40.0"/>
+  <arg name="min_dock_width"    default="2.0"/>
+  <arg name="max_dock_width"    default="20.0"/>
+  <arg name="z_axis_min"        default="-0.1"/>
+  <arg name="z_axis_max"        default="5"/>
+  <arg name="cluster_size_min"  default="20"/>
+  <arg name="cluster_size_max"  default="10000"/>
+
+  <!-- Task arguments — exposed so they can be overridden from the
+       parent launch or the command line. -->
+  <arg name="dock_side"         default="starboard"
+       doc="port | starboard"/>
+  <arg name="bow_direction"     default="-x"
+       doc="+x | -x | -y"/>
+  <arg name="staging_distance"  default="8.0"/>
+  <arg name="berth_standoff"    default="1.0"/>
+  <arg name="inflation_radius"  default="3.0"/>
+  <arg name="berth_long_offset" default="0.0"/>
+
+  <arg name="staging_radius"    default="2.0"/>
+  <arg name="dock_tolerance"    default="0.5"/>
+  <arg name="dock_yaw_tol"      default="15.0"/>
+
+  <arg name="lock_frames"       default="10"/>
+  <arg name="lock_radius"       default="0.5"/>
+
+  <arg name="task_output"       default="dock_run.csv"/>
+  <arg name="task_timeout"      default="300.0"/>
+  <arg name="dock_timeout"      default="30.0"/>
+  <arg name="grace"             default="10.0"/>
+
+  <!-- ===================================================================
+       1. Adaptive clustering (C++, unchanged)
+       =================================================================== -->
+  <node name="adaptive_clustering" pkg="adaptive_clustering"
+        type="adaptive_clustering" output="screen">
+    <param name="sensor_model"      value="$(arg sensor_model)"/>
+    <param name="z_axis_min"        value="$(arg z_axis_min)"/>
+    <param name="z_axis_max"        value="$(arg z_axis_max)"/>
+    <param name="cluster_size_min"  value="$(arg cluster_size_min)"/>
+    <param name="cluster_size_max"  value="$(arg cluster_size_max)"/>
+    <param name="print_fps"         value="false"/>
+    <remap from="velodyne_points"   to="$(arg pointcloud_topic)"/>
+  </node>
+
+  <!-- ===================================================================
+       2. Dock pose estimator (C++, unchanged) — publishes /dock_pose
+       and /dock_dims. We keep lock_after_frames at 0 here because the
+       Python task does its OWN locking (with explicit stability check)
+       and we want fresh poses until our task locks.
+       =================================================================== -->
+  <node name="dock_pose_estimator" pkg="dock_perception"
+        type="l_shape_fitting" output="screen">
+    <param name="target_frame"       value="$(arg target_frame)"/>
+    <param name="criterion"          value="$(arg criterion)"/>
+    <param name="min_dock_length"    value="$(arg min_dock_length)"/>
+    <param name="max_dock_length"    value="$(arg max_dock_length)"/>
+    <param name="min_dock_width"     value="$(arg min_dock_width)"/>
+    <param name="max_dock_width"     value="$(arg max_dock_width)"/>
+    <param name="min_cluster_points" value="$(arg cluster_size_min)"/>
+    <param name="merge_radius"       value="3.0"/>
+    <param name="lock_after_frames"  value="0"/>
+  </node>
+
+  <!-- ===================================================================
+       3. Python docking task — replaces dock_approach_planner.
+
+       Subscribes:  /dock_pose, /dock_dims, /odometry/filtered,
+                    /p3d_blueboat, /planned_path, /planned_curvatures,
+                    /waypoints, /speed_heading, /debug/*, thrust cmds.
+       Publishes:   /move_base_simple/goal (staging, then dock).
+       =================================================================== -->
+  <node name="go_to_dock_task" pkg="blueboat_bringup"
+        type="GoToDock.py" output="screen"
+        args="--dock-side       $(arg dock_side)
+              --bow-direction   '$(arg bow_direction)'
+              --staging-distance $(arg staging_distance)
+              --berth-standoff  $(arg berth_standoff)
+              --inflation-radius $(arg inflation_radius)
+              --berth-long-offset $(arg berth_long_offset)
+              --staging-radius  $(arg staging_radius)
+              --dock-tolerance  $(arg dock_tolerance)
+              --dock-yaw-tol    $(arg dock_yaw_tol)
+              --lock-frames     $(arg lock_frames)
+              --lock-radius     $(arg lock_radius)
+              --output          $(arg task_output)
+              --timeout         $(arg task_timeout)
+              --dock-timeout    $(arg dock_timeout)
+              --grace           $(arg grace)"/>
+
+  <!-- ===================================================================
+       4. Optional: keep the docking_metric_node from your old launch if
+       you still want its output for cross-validation. The Python task
+       writes its own summary CSV with the literature-grounded metric set
+       (success, pos err, yaw err, duration, path length, min clearance).
+       =================================================================== -->
+  <!--
+  <node name="docking_metric" pkg="dock_perception"
+        type="docking_metric_node" output="screen"/>
+  -->
+
+</launch>

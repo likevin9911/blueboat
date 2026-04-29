@@ -2,21 +2,23 @@
 """
 GoToPosition Task
 =================
-Publishes a goal to /move_base_simple/goal and records performance data.
+Single-goal driver. Publishes one PoseStamped to /move_base_simple/goal,
+records data, and exits.
 
-Arrival rule: position only — within position_tol meters of the goal.
-After arrival, records GRACE_AFTER_ARRIVAL seconds (default 10) and exits.
-Outer --timeout still applies as a hard cap if arrival never happens.
-Arrival check uses /p3d_blueboat (ground truth).
+Architectural note (matters with the updated guidance):
+    Guidance now decides arrival on its own (map-frame distance to
+    path end) and holds (0, psi) once arrived. This task's p3d-based
+    arrival check is for *evaluation logging and exit timing only* —
+    it does not influence the boat's behavior. Keeping p3d here gives
+    you a ground-truth measurement independent of EKF/cartographer
+    drift, which matters when comparing runs across configurations.
 
-Records two kinds of data:
-  1. Time-series CSV at RECORD_HZ with all topics that matter for guidance
-     and controller analysis. An `arrived` flag column marks rows inside
-     the post-arrival grace window.
-  2. Per-goal artifacts (planned_path, planned_curvatures, waypoints) saved
-     once next to the main CSV.
+Records:
+  1. Time-series CSV at RECORD_HZ.
+  2. Per-goal artifacts (planned_path, planned_curvatures, waypoints).
+  3. One-line summary at end (success, final position error, duration,
+     path length) for batch comparison across runs.
 
-rosrun blueboat_bringup GoToPosition.py
 rosrun blueboat_bringup GoToPosition.py --x 22.36 --y -3.70 --output run1.csv
 """
 
@@ -37,15 +39,14 @@ from usv_msgs.msg import SpeedCourse
 
 
 # ===========================================================================
-# GLOBAL CONFIG
+# CONFIG
 # ===========================================================================
 
 DEFAULT_X      = 22.36
 DEFAULT_Y      = -3.70
-DEFAULT_YAW    = 0.0          # degrees — yaw is published with the goal but
-                              # NOT used for arrival in this task
+DEFAULT_YAW    = 0.0
 DEFAULT_OUTPUT = "run1.csv"
-TIMEOUT        = 60.0         # seconds — hard cap if arrival never happens
+TIMEOUT        = 60.0
 RECORD_HZ      = 10.0
 
 POSITION_TOL_M      = 0.8
@@ -132,6 +133,11 @@ class GoToPositionTask:
         self._arrived          = False
         self._arrival_ros_time = None
 
+        # Path-length tracking (from p3d) for run summary
+        self._prev_p3d_xy   = None
+        self._path_length   = 0.0
+        self._t_start       = None
+
         self._path_written       = False
         self._curvatures_written = False
         self._waypoints_written  = False
@@ -151,19 +157,30 @@ class GoToPositionTask:
         with self.lock: self._odom = self._unpack_odom(msg)
 
     def cb_p3d(self, msg):
-        # p3d also drives the arrival check. Position-only here.
+        # Ground truth from Gazebo. Used here for:
+        #   - arrival latch (drives task termination)
+        #   - path-length integration
+        # Guidance does NOT use p3d; it has its own arrival logic.
         unpacked = self._unpack_odom(msg)
         with self.lock:
             self._p3d = unpacked
+            px, py = unpacked[0], unpacked[1]
+
+            if self._prev_p3d_xy is not None:
+                dx = px - self._prev_p3d_xy[0]
+                dy = py - self._prev_p3d_xy[1]
+                self._path_length += math.hypot(dx, dy)
+            self._prev_p3d_xy = (px, py)
+
             if not self._arrived:
-                px, py = unpacked[0], unpacked[1]
                 pos_err = math.hypot(px - self.x, py - self.y)
                 if pos_err < self.pos_tol:
                     self._arrived          = True
                     self._arrival_ros_time = rospy.Time.now()
                     rospy.loginfo(
                         f"[GoToPosition] ARRIVED  pos_err={pos_err:.2f} m "
-                        f"-> recording {self.grace}s grace")
+                        f"-> recording {self.grace}s grace "
+                        f"(p3d-based eval; guidance independently holds)")
 
     def cb_left_thrust(self, msg):
         with self.lock: self._left_thrust = msg.data
@@ -255,6 +272,36 @@ class GoToPositionTask:
             )
         self._writer.writerow(row)
 
+    def _write_summary(self):
+        """One-line summary CSV next to the time-series for batch eval."""
+        summary_csv = f"{_stem(self.output)}_summary.csv"
+        with self.lock:
+            success     = self._arrived
+            final_x     = self._p3d[0]
+            final_y     = self._p3d[1]
+            duration    = ((self._arrival_ros_time - self._t_start).to_sec()
+                           if success and self._t_start else None)
+            path_len    = self._path_length
+        if final_x is None or final_y is None:
+            final_pos_err = None
+        else:
+            final_pos_err = math.hypot(final_x - self.x, final_y - self.y)
+        try:
+            with open(summary_csv, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["success", "final_pos_err_m",
+                            "duration_s", "path_length_m"])
+                w.writerow([int(success),
+                            f"{final_pos_err:.3f}" if final_pos_err is not None else "",
+                            f"{duration:.3f}" if duration is not None else "",
+                            f"{path_len:.3f}"])
+            rospy.loginfo(
+                f"[GoToPosition] summary: success={success}  "
+                f"final_pos_err={final_pos_err}  duration={duration}  "
+                f"path_len={path_len:.2f} m  -> {summary_csv}")
+        except Exception as e:
+            rospy.logwarn(f"[GoToPosition] failed to write summary: {e}")
+
     def run(self):
         rospy.init_node("go_to_position_task", anonymous=True)
 
@@ -301,16 +348,18 @@ class GoToPositionTask:
             f"[GoToPosition] Goal -> x={self.x}  y={self.y}  "
             f"yaw={math.degrees(self.yaw_rad):.1f} deg (yaw informational only)")
         rospy.loginfo(
-            f"[GoToPosition] Tolerance: pos<{self.pos_tol} m, "
-            f"grace={self.grace}s, hard timeout={self.timeout}s")
+            f"[GoToPosition] Eval tolerance (p3d): pos<{self.pos_tol} m. "
+            f"Guidance handles its own arrival/hold independently.")
+        rospy.loginfo(
+            f"[GoToPosition] grace={self.grace}s, hard timeout={self.timeout}s")
 
+        self._t_start = rospy.Time.now()
         rospy.Timer(rospy.Duration(1.0 / RECORD_HZ), self._write_row)
 
-        start = rospy.Time.now()
         rate = rospy.Rate(20.0)
         while not rospy.is_shutdown():
             now = rospy.Time.now()
-            elapsed = (now - start).to_sec()
+            elapsed = (now - self._t_start).to_sec()
 
             if elapsed >= self.timeout:
                 if self._arrived:
@@ -334,10 +383,9 @@ class GoToPositionTask:
 
         self._csvfile.flush()
         self._csvfile.close()
+        self._write_summary()
         rospy.loginfo(f"[GoToPosition] Done — saved {self.output}")
 
-
-# ===========================================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

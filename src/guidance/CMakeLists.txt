@@ -192,14 +192,19 @@ include_directories(
 ## Add folders to be run by python nosetests
 # catkin_add_nosetests(test)
 
-add_executable(guidance_node
-  include/guidance/guidance.h
-  src/guidance.cpp
-  src/guidance_node.cpp
-)
-add_dependencies(guidance_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
-target_link_libraries(guidance_node
-  ${catkin_LIBRARIES}
-)
+#add_executable(guidance_node
+#  include/guidance/guidance.h
+#  src/guidance.cpp
+#  src/guidance_node.cpp
+#)
+#add_dependencies(guidance_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+#target_link_libraries(guidance_node
+#  ${catkin_LIBRARIES}
+#)
 
 
+add_executable(regulated_pure_pursuit_guidance_node
+  src/regulated_pure_pursuit_guidance.cpp
+  src/regulated_pure_pursuit_guidance_node.cpp)
+target_link_libraries(regulated_pure_pursuit_guidance_node ${catkin_LIBRARIES})
+add_dependencies(regulated_pure_pursuit_guidance_node ${catkin_EXPORTED_TARGETS})

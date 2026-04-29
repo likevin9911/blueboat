@@ -6,16 +6,16 @@
        ============================================================ -->
   <arg name="task"         default="point_to_point"
        doc="point_to_point | coverage"/>
-  <arg name="search_mode"  default="astar"
+  <arg name="search_mode"  default="rrt"
        doc="none | astar | rrt"/>
-  <arg name="planner_type" default="cc_dubins"
+  <arg name="planner_type" default="reeds_shepp"
        doc="dubins | cc_dubins | reeds_shepp | hc_rs"/>
-  <arg name="use_vfh"      default="true"
+  <arg name="use_vfh"      default="false"
        doc="true | false  (true wires VFH between guidance and controller)"/>
 
-  <arg name="turning_radius"  default="1.0"/>
-  <arg name="path_resolution" default="0.05"/>
-  <arg name="max_sharpness"   default="1.0"/>
+  <arg name="turning_radius"  default="0.5"/>
+  <arg name="path_resolution" default="0.2"/>
+  <arg name="max_sharpness"   default="0.2"/>
 
   <param name="/use_sim_time" value="true"/>
 
@@ -31,7 +31,8 @@
   <node name="cartographer_node" pkg="cartographer_ros"
         type="cartographer_node" args="
         -configuration_directory $(find blueboat_bringup)/config
-        -configuration_basename sim_blueboat.lua"
+        -configuration_basename sim_blueboat.lua
+        --minloglevel=2"
         output="screen">
     <remap from="scan" to="filtered_scan" />
     <remap from="imu"  to="imu/data" />
@@ -41,6 +42,42 @@
   <include file="$(find map_inflating)/launch/map_inflating.launch">
     <arg name="inflating_radius" value="3.0" />
   </include>
+
+  <node name="regulated_pure_pursuit_guidance_node"
+        pkg="guidance"
+        type="regulated_pure_pursuit_guidance_node" output="screen">
+    <param name="path_topic"      value="/planned_path"/>
+    <param name="curvature_topic" value="/planned_curvatures"/>
+    <!-- Speed limits (correct names) -->
+    <param name="max_linear_vel"  value="1.5"/>
+    <param name="min_linear_vel"  value="-0.8"/>
+    <!-- Lookahead -->
+    <param name="use_velocity_scaled_lookahead_dist" value="true"/>
+    <param name="min_lookahead_dist" value="0.6"/>
+    <param name="max_lookahead_dist" value="0.9"/>
+    <param name="lookahead_time"     value="1.5"/>
+    <!-- Curvature regulation (this is the knob that fixes overshoot) -->
+    <param name="use_regulated_linear_velocity_scaling" value="true"/>
+    <param name="regulated_linear_scaling_min_radius"   value="1.5"/>
+    <param name="regulated_linear_scaling_min_speed"    value="0.2"/>
+    <!-- Heading regulation -->
+    <param name="use_heading_regulation"     value="true"/>
+    <param name="heading_scaling_threshold"  value="0.4"/>
+    <!-- Approach -->
+    <param name="approach_velocity_scaling_dist" value="5.0"/>
+    <param name="min_approach_linear_velocity"   value="0"/>
+    <!-- Dynamic window OFF for first test -->
+    <param name="use_dynamic_window" value="true"/>
+    <param name="max_linear_accel" value="0.6"/>
+    <param name="max_linear_decel" value="-1.2"/>
+    <param name="max_angular_accel" value="4"/>
+    <param name="max_angular_decel" value="-4.0"/>
+    <!-- Cursor / arrival -->
+    <param name="goal_tolerance" value="0.5"/>
+    <param name="search_window"  value="10"/>
+    <param name="control_frequency" value="10.0"/>
+    <remap if="$(arg use_vfh)" from="speed_heading" to="/speed_heading_raw"/>
+  </node>
 
   <!-- ============================================================
        Task layer
@@ -182,8 +219,8 @@
        to /speed_heading_raw (or directly to /speed_heading if VFH off).
        guidance.cpp publishes to "speed_heading"; we remap.
        ============================================================ -->
-  <group if="$(arg use_vfh)">
-    <node name="guidance_node" pkg="guidance" type="guidance_node" output="screen">
+  <!-- <group if="$(arg use_vfh)">
+    <node name="regulated_pure_pursuit_guidance_node" pkg="guidance" type="regulated_pure_pursuit_guidance_node" output="screen">
       <param name="path_topic"           value="/planned_path"/>
       <param name="curvature_topic"      value="/planned_curvatures"/>
       <param name="max_speed"            value="1.5"/>
@@ -195,16 +232,15 @@
   </group>
 
   <group unless="$(arg use_vfh)">
-    <node name="guidance_node" pkg="guidance" type="guidance_node" output="screen">
+    <node name="regulated_pure_pursuit_guidance_node" pkg="guidance" type="regulated_pure_pursuit_guidance_node" output="screen">
       <param name="path_topic"           value="/planned_path"/>
       <param name="curvature_topic"      value="/planned_curvatures"/>
       <param name="max_speed"            value="1.5"/>
       <param name="max_speed_turn"       value="0.6"/>
       <param name="min_speed"            value="0.1"/>
       <param name="kappa_turn_threshold" value="0.2"/>
-      <!-- No remap: publishes directly to /speed_heading -->
     </node>
-  </group>
+  </group> -->
 
   <!-- ============================================================
        VFH (optional) — only spawned if use_vfh is true
@@ -228,11 +264,11 @@
   <node name="BlueboatController" pkg="blueboat_control" type="controller">
     <param name="Kp_psi"   value="4.0"/>
     <param name="Kd_psi"   value="4.0"/>
-    <param name="Ki_psi"   value="0.05"/>
+    <param name="Ki_psi"   value="1"/>
     <param name="mass_psi" value="9.0"/>
     <param name="damp_psi" value="20.0"/>
-    <param name="Kp_u"     value="2.0"/>
-    <param name="Ki_u"     value="1.0"/>
+    <param name="Kp_u"     value="5.0"/>
+    <param name="Ki_u"     value="3.0"/>
     <param name="mass_u"   value="19.28"/>
     <param name="damp_u"   value="20.0"/>
   </node>

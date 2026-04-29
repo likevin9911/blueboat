@@ -2,22 +2,17 @@
 """
 GoToPose Task
 =============
-Publishes a goal to /move_base_simple/goal and records performance data.
+Single-goal driver with position+yaw arrival check. Same architecture
+as GoToPosition: arrival is checked via /p3d_blueboat (ground truth)
+for evaluation purposes only — guidance does its own arrival check
+in the map frame and holds (0, psi) once arrived.
 
-Differs from GoToPosition:
-  - Arrival is position AND yaw aligned (both within tolerance).
-  - Arrival check uses /p3d_blueboat (ground truth) — not /odometry/filtered.
-  - After arrival, records GRACE_AFTER_ARRIVAL seconds (default 10) and exits.
-  - Outer --timeout still applies as a hard cap if arrival never happens.
+Records:
+  1. Time-series CSV at RECORD_HZ.
+  2. Per-goal artifacts (planned_path, planned_curvatures, waypoints).
+  3. One-line summary at end (success, final pos+yaw error, duration,
+     path length) for batch comparison across runs.
 
-Records two kinds of data:
-  1. Time-series CSV at RECORD_HZ with all topics that matter for guidance
-     and controller analysis. Adds an `arrived` flag column so you can mark
-     which rows are inside the post-arrival grace window.
-  2. Per-goal artifacts (planned_path, planned_curvatures, waypoints) saved
-     once next to the main CSV.
-
-rosrun blueboat_bringup GoToPose.py
 rosrun blueboat_bringup GoToPose.py --x 22.36 --y -3.70 --yaw 90 --output run1.csv
 """
 
@@ -34,31 +29,26 @@ from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Float32, Float32MultiArray
 import tf.transformations as tft
 
-# usv_msgs/SpeedCourse — the same message your guidance and controller use.
 from usv_msgs.msg import SpeedCourse
 
 
 # ===========================================================================
-# GLOBAL CONFIG
+# CONFIG
 # ===========================================================================
 
 DEFAULT_X      = 22.36
 DEFAULT_Y      = -3.70
-DEFAULT_YAW    = 0.0          # degrees
-DEFAULT_OUTPUT = "GoToPoseTask3.csv"
-TIMEOUT        = 60.0         # seconds — hard cap if arrival never happens
+DEFAULT_YAW    = 0.0
+DEFAULT_OUTPUT = "GoToPoseTask.csv"
+TIMEOUT        = 60.0
 RECORD_HZ      = 10.0
 
-# Arrival tolerances. Position is loose enough to be achievable in current/
-# wind; yaw is reasonably tight so "aligned" actually means aligned. Bump
-# yaw_tol up if the boat can't ever satisfy it (open-loop yaw after arrival).
-POSITION_TOL_M     = 0.1      # meters
-YAW_TOL_DEG        = 10.0     # degrees
-GRACE_AFTER_ARRIVAL = 10.0    # seconds of recording after arrival latch
+POSITION_TOL_M      = 0.5
+YAW_TOL_DEG         = 10.0
+GRACE_AFTER_ARRIVAL = 10.0
 
 GOAL_FRAME     = "map"
 
-# --- time-series subscribers ---
 TOPIC_ODOM_FILTERED = "/odometry/filtered"
 TOPIC_ODOM          = "/odom"
 TOPIC_P3D           = "/p3d_blueboat"
@@ -73,10 +63,8 @@ TOPIC_DBG_YAW_DES   = "/debug/yaw_desired"
 TOPIC_DBG_THR_L     = "/debug/thrust_left"
 TOPIC_DBG_THR_R     = "/debug/thrust_right"
 
-# --- goal pub ---
 TOPIC_GOAL          = "/move_base_simple/goal"
 
-# --- per-goal artifact subscribers ---
 TOPIC_PLANNED_PATH       = "/planned_path"
 TOPIC_PLANNED_CURVATURES = "/planned_curvatures"
 TOPIC_WAYPOINTS          = "/waypoints"
@@ -85,24 +73,17 @@ TOPIC_WAYPOINTS          = "/waypoints"
 
 CSV_HEADER = [
     "wall_time", "ros_time",
-    # odom/filtered
     "odom_filt_x", "odom_filt_y", "odom_filt_z",
     "odom_filt_yaw", "odom_filt_vx", "odom_filt_vy",
-    # odom
     "odom_x", "odom_y", "odom_z",
     "odom_yaw", "odom_vx", "odom_vy",
-    # p3d (ground truth)
     "p3d_x", "p3d_y", "p3d_z",
     "p3d_yaw", "p3d_vx", "p3d_vy",
-    # raw thrust commands
     "left_thrust", "right_thrust",
-    # guidance -> controller
     "cmd_speed", "cmd_course",
-    # controller debug
     "dbg_speed_actual", "dbg_speed_desired",
     "dbg_yaw_actual",   "dbg_yaw_desired",
     "dbg_thrust_left",  "dbg_thrust_right",
-    # arrival flag (1 once latched and during grace, else 0)
     "arrived",
 ]
 
@@ -137,7 +118,6 @@ class GoToPoseTask:
         self.grace    = grace
         self.lock     = threading.Lock()
 
-        # Latest cached values
         self._odom_filtered = [None] * 6
         self._odom          = [None] * 6
         self._p3d           = [None] * 6
@@ -152,18 +132,16 @@ class GoToPoseTask:
         self._dbg_thr_l     = None
         self._dbg_thr_r     = None
 
-        # Arrival state
         self._arrived            = False
-        self._arrival_ros_time   = None  # rospy.Time when latched
+        self._arrival_ros_time   = None
 
-        # Once-per-goal artifact write tracking
+        self._prev_p3d_xy   = None
+        self._path_length   = 0.0
+        self._t_start       = None
+
         self._path_written       = False
         self._curvatures_written = False
         self._waypoints_written  = False
-
-    # -----------------------------------------------------------------------
-    # Time-series callbacks
-    # -----------------------------------------------------------------------
 
     @staticmethod
     def _unpack_odom(msg):
@@ -182,12 +160,20 @@ class GoToPoseTask:
             self._odom = self._unpack_odom(msg)
 
     def cb_p3d(self, msg):
-        # p3d also drives the arrival check. Latch once; never un-latch.
+        # Ground truth. Drives evaluation arrival latch and path-length
+        # integration. Guidance does NOT use this.
         unpacked = self._unpack_odom(msg)
         with self.lock:
             self._p3d = unpacked
+            px, py, _, pyaw, _, _ = unpacked
+
+            if self._prev_p3d_xy is not None:
+                dx = px - self._prev_p3d_xy[0]
+                dy = py - self._prev_p3d_xy[1]
+                self._path_length += math.hypot(dx, dy)
+            self._prev_p3d_xy = (px, py)
+
             if not self._arrived:
-                px, py, _, pyaw, _, _ = unpacked
                 pos_err = math.hypot(px - self.x, py - self.y)
                 yaw_err = abs(_wrap_pi(pyaw - self.yaw_rad))
                 if pos_err < self.pos_tol and yaw_err < self.yaw_tol:
@@ -196,7 +182,8 @@ class GoToPoseTask:
                     rospy.loginfo(
                         f"[GoToPose] ARRIVED  pos_err={pos_err:.2f} m  "
                         f"yaw_err={math.degrees(yaw_err):.1f} deg  "
-                        f"-> recording {self.grace}s grace")
+                        f"-> recording {self.grace}s grace "
+                        f"(p3d-based eval; guidance independently holds)")
 
     def cb_left_thrust(self, msg):
         with self.lock: self._left_thrust = msg.data
@@ -218,10 +205,6 @@ class GoToPoseTask:
         with self.lock: self._dbg_thr_l = msg.data
     def cb_dbg_thr_r(self, msg):
         with self.lock: self._dbg_thr_r = msg.data
-
-    # -----------------------------------------------------------------------
-    # Per-goal artifact callbacks
-    # -----------------------------------------------------------------------
 
     def cb_planned_path(self, msg):
         path_csv = f"{_stem(self.output)}_planned_path.csv"
@@ -276,10 +259,6 @@ class GoToPoseTask:
         except Exception as e:
             rospy.logwarn(f"[GoToPose] failed to write waypoints: {e}")
 
-    # -----------------------------------------------------------------------
-    # Timer callback
-    # -----------------------------------------------------------------------
-
     def _write_row(self, event):
         with self.lock:
             row = (
@@ -296,12 +275,48 @@ class GoToPoseTask:
             )
         self._writer.writerow(row)
 
-    # -----------------------------------------------------------------------
+    def _write_summary(self):
+        summary_csv = f"{_stem(self.output)}_summary.csv"
+        with self.lock:
+            success     = self._arrived
+            final_x     = self._p3d[0]
+            final_y     = self._p3d[1]
+            final_yaw   = self._p3d[3]
+            duration    = ((self._arrival_ros_time - self._t_start).to_sec()
+                           if success and self._t_start else None)
+            path_len    = self._path_length
+        if final_x is None or final_y is None:
+            final_pos_err = None
+        else:
+            final_pos_err = math.hypot(final_x - self.x, final_y - self.y)
+        if final_yaw is None:
+            final_yaw_err = None
+        else:
+            final_yaw_err = math.degrees(abs(_wrap_pi(final_yaw - self.yaw_rad)))
+        try:
+            with open(summary_csv, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["success", "final_pos_err_m",
+                            "final_yaw_err_deg", "duration_s",
+                            "path_length_m"])
+                w.writerow([
+                    int(success),
+                    f"{final_pos_err:.3f}" if final_pos_err is not None else "",
+                    f"{final_yaw_err:.3f}" if final_yaw_err is not None else "",
+                    f"{duration:.3f}"      if duration      is not None else "",
+                    f"{path_len:.3f}",
+                ])
+            rospy.loginfo(
+                f"[GoToPose] summary: success={success}  "
+                f"pos_err={final_pos_err}  yaw_err={final_yaw_err}  "
+                f"duration={duration}  path_len={path_len:.2f} m  "
+                f"-> {summary_csv}")
+        except Exception as e:
+            rospy.logwarn(f"[GoToPose] failed to write summary: {e}")
 
     def run(self):
         rospy.init_node("go_to_pose_task", anonymous=True)
 
-        # Time-series subscribers
         rospy.Subscriber(TOPIC_ODOM_FILTERED, Odometry,    self.cb_odom_filtered)
         rospy.Subscriber(TOPIC_ODOM,          Odometry,    self.cb_odom)
         rospy.Subscriber(TOPIC_P3D,           Odometry,    self.cb_p3d)
@@ -316,18 +331,15 @@ class GoToPoseTask:
         rospy.Subscriber(TOPIC_DBG_THR_L,     Float32, self.cb_dbg_thr_l)
         rospy.Subscriber(TOPIC_DBG_THR_R,     Float32, self.cb_dbg_thr_r)
 
-        # Per-goal artifact subscribers
         rospy.Subscriber(TOPIC_PLANNED_PATH,       Path,              self.cb_planned_path)
         rospy.Subscriber(TOPIC_PLANNED_CURVATURES, Float32MultiArray, self.cb_planned_curvatures)
         rospy.Subscriber(TOPIC_WAYPOINTS,          Path,              self.cb_waypoints)
 
-        # CSV
         self._csvfile = open(self.output, "w", newline="")
         self._writer  = csv.writer(self._csvfile)
         self._writer.writerow(CSV_HEADER)
         rospy.loginfo(f"[GoToPose] Recording -> {self.output}  @ {RECORD_HZ} Hz")
 
-        # Goal
         goal_pub = rospy.Publisher(TOPIC_GOAL, PoseStamped, queue_size=1, latch=True)
         rospy.sleep(1.0)
 
@@ -348,19 +360,19 @@ class GoToPoseTask:
             f"[GoToPose] Goal -> x={self.x}  y={self.y}  "
             f"yaw={math.degrees(self.yaw_rad):.1f} deg")
         rospy.loginfo(
-            f"[GoToPose] Tolerances: pos<{self.pos_tol} m, "
-            f"yaw<{math.degrees(self.yaw_tol):.1f} deg, "
-            f"grace={self.grace}s, hard timeout={self.timeout}s")
+            f"[GoToPose] Eval tolerances (p3d): pos<{self.pos_tol} m, "
+            f"yaw<{math.degrees(self.yaw_tol):.1f} deg. "
+            f"Guidance handles its own arrival/hold independently.")
+        rospy.loginfo(
+            f"[GoToPose] grace={self.grace}s, hard timeout={self.timeout}s")
 
+        self._t_start = rospy.Time.now()
         rospy.Timer(rospy.Duration(1.0 / RECORD_HZ), self._write_row)
 
-        # Main loop: poll for arrival + grace, with hard timeout.
-        # Uses ROS time so it respects sim clock.
-        start = rospy.Time.now()
         rate = rospy.Rate(20.0)
         while not rospy.is_shutdown():
             now = rospy.Time.now()
-            elapsed = (now - start).to_sec()
+            elapsed = (now - self._t_start).to_sec()
 
             if elapsed >= self.timeout:
                 if self._arrived:
@@ -372,24 +384,21 @@ class GoToPoseTask:
                 break
 
             with self.lock:
-                arrived = self._arrived
+                arrived   = self._arrived
                 arrival_t = self._arrival_ros_time
 
             if arrived and arrival_t is not None:
                 if (now - arrival_t).to_sec() >= self.grace:
-                    rospy.loginfo(
-                        f"[GoToPose] grace window complete "
-                        f"(t={elapsed:.1f}s)")
+                    rospy.loginfo(f"[GoToPose] grace window complete (t={elapsed:.1f}s)")
                     break
 
             rate.sleep()
 
         self._csvfile.flush()
         self._csvfile.close()
+        self._write_summary()
         rospy.loginfo(f"[GoToPose] Done — saved {self.output}")
 
-
-# ===========================================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

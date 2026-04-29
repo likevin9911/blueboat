@@ -1,40 +1,55 @@
 #!/usr/bin/env python3
 """
-GoThroughPositions Task
-=======================
-Drives the boat through a sequence of waypoints, publishing each as a
-new goal on /move_base_simple/goal once the previous one is reached.
+GoThroughPositions Task — acceptance-circle waypoint switching.
 
-Arrival rule:
-  - Intermediate waypoints: position only, within --pos-tol meters.
-  - Final waypoint:         position AND yaw, within --pos-tol meters
-                            and --yaw-tol degrees.
+Rationale for switching scheme (literature):
+============================================
+Marine-vehicle path-following literature (Fossen & Pettersen 2014;
+Lekkas & Fossen 2014; Liu et al. 2020 "Path Following Based on
+Waypoints..."; Tandfonline 2025 "Maneuverability-based adaptive
+LOS guidance") consistently uses the **acceptance circle** (also
+called "circle of acceptance" or "switching radius") for waypoint
+sequencing on underactuated surface vessels:
 
-Why the asymmetry: holding yaw at every intermediate stalls the run on
-benchmarks where the boat just needs to pass through. The final pose is
-where alignment actually matters for scoring "did we reach the pose."
+    "The straight path is switched to the next one when the AUV
+     enters a circle of acceptance. The center of the circle is
+     at p_{k+1}, and the radius is R_k."
 
-After the final waypoint's arrival latch, records --grace seconds and
-exits. Outer --timeout still applies as a hard cap.
+This is a PREEMPTIVE switch — the next waypoint is activated as
+soon as the vessel enters the radius around the *current* one,
+**before** the controller has stopped. This avoids the
+deceleration-acceleration cycle at every waypoint, which wastes
+energy and produces large transient cross-track errors on
+underactuated boats that can't stop precisely.
 
-Records two kinds of data:
-  1. Time-series CSV at RECORD_HZ. A `wp_index` column tracks which
-     waypoint is currently active (0-based), and `arrived_final` flags
-     rows inside the post-final-arrival grace window.
-  2. Per-goal artifacts (planned_path, planned_curvatures, waypoints)
-     saved as <stem>_wp{i}_<artifact>.csv — one set per waypoint segment.
+Acceptance radius selection:
+    - Non-final waypoints: ~1-3× the boat's minimum turning radius.
+      Larger radii give smoother trajectories but cut more corner.
+      Lekkas & Fossen 2014 recommend radius >= turning_radius for
+      feasibility; Liu 2020 uses 2-3 ship lengths.
+    - Final waypoint: tight (e.g. 0.5 m) — this is where you actually
+      want the boat to stop, and you accept the deceleration penalty.
+
+The variable-radius extension (Tandfonline 2025) adapts the radius
+per waypoint based on the angle between incoming and outgoing path
+segments — sharp turns get smaller radii so the boat doesn't cut
+the corner too aggressively. We expose --acceptance-radius and
+--final-tolerance to control this; per-waypoint adaptive radii
+are a future extension.
+
+What the guidance node does on its end:
+    With the matching guidance change, when the boat is "arrived"
+    on the current path, guidance publishes (0, current_psi)
+    continuously — it holds position. This task can preempt that
+    at any time by publishing a new goal: guidance receives the
+    new path, resets m_arrived = false, and resumes tracking.
 
 Examples:
-  rosrun blueboat_bringup GoThroughPositions.py \\
-      --waypoints "10,0,0  20,5,90  22.36,-3.7,0" \\
-      --output multi.csv
-
-  # CSV-style waypoint string also works:
-  rosrun blueboat_bringup GoThroughPositions.py \\
-      --waypoints "10,0,0;20,5,90;22.36,-3.7,0"
-
-Waypoint format: "x,y,yaw_deg" tuples separated by spaces or semicolons.
-The last tuple is treated as the final waypoint.
+    rosrun blueboat_bringup GoThroughPositions.py \\
+        --waypoints "10,0,0  20,5,90  25,5,0" \\
+        --acceptance-radius 2.0 \\
+        --final-tolerance 0.5 \\
+        --output run.csv
 """
 
 import rospy
@@ -55,19 +70,22 @@ from usv_msgs.msg import SpeedCourse
 
 
 # ===========================================================================
-# GLOBAL CONFIG
+# CONFIG
 # ===========================================================================
 
-DEFAULT_WAYPOINTS = "10,0,0  20,5,90  22.36,-3.7,0"
+DEFAULT_WAYPOINTS = "10,0,0  20,5,90  25.36,5,0"
 DEFAULT_OUTPUT    = "multi.csv"
-TIMEOUT           = 180.0     # hard cap for the whole sequence
+TIMEOUT           = 300.0
 RECORD_HZ         = 10.0
 
-POSITION_TOL_M       = 0.8
-YAW_TOL_DEG          = 15.0
-GRACE_AFTER_ARRIVAL  = 10.0   # only applied after the FINAL waypoint
+# Literature-recommended starting points. Tune --acceptance-radius up for
+# more open turns (smoother, more cut), down for tighter cornering.
+ACCEPTANCE_RADIUS_M  = 2.0   # used for all NON-FINAL waypoints
+FINAL_TOLERANCE_M    = 0.5   # used ONLY for the final waypoint
+YAW_TOL_DEG          = 10.0  # only checked at final waypoint when --final-pose
+GRACE_AFTER_ARRIVAL  = 10.0
 
-GOAL_FRAME           = "map"
+GOAL_FRAME = "map"
 
 TOPIC_ODOM_FILTERED = "/odometry/filtered"
 TOPIC_ODOM          = "/odom"
@@ -83,11 +101,10 @@ TOPIC_DBG_YAW_DES   = "/debug/yaw_desired"
 TOPIC_DBG_THR_L     = "/debug/thrust_left"
 TOPIC_DBG_THR_R     = "/debug/thrust_right"
 
-TOPIC_GOAL          = "/move_base_simple/goal"
-
-TOPIC_PLANNED_PATH       = "/planned_path"
-TOPIC_PLANNED_CURVATURES = "/planned_curvatures"
-TOPIC_WAYPOINTS          = "/waypoints"
+TOPIC_GOAL                = "/move_base_simple/goal"
+TOPIC_PLANNED_PATH        = "/planned_path"
+TOPIC_PLANNED_CURVATURES  = "/planned_curvatures"
+TOPIC_WAYPOINTS           = "/waypoints"
 
 # ===========================================================================
 
@@ -104,9 +121,9 @@ CSV_HEADER = [
     "dbg_speed_actual", "dbg_speed_desired",
     "dbg_yaw_actual",   "dbg_yaw_desired",
     "dbg_thrust_left",  "dbg_thrust_right",
-    # Sequence state
-    "wp_index",        # which waypoint is currently active (0-based)
-    "arrived_final",   # 1 once the final waypoint has been reached
+    "wp_index",
+    "current_acceptance_radius",
+    "arrived_final",
 ]
 
 
@@ -127,14 +144,8 @@ def _wrap_pi(a):
 
 
 def parse_waypoints(s):
-    """
-    Accept "x,y,yaw  x,y,yaw" or "x,y,yaw;x,y,yaw" — splits on whitespace
-    OR semicolons. yaw is in degrees.
-    Returns list of (x, y, yaw_rad).
-    """
     if not s or not s.strip():
         raise ValueError("empty --waypoints string")
-    # Split on any run of whitespace or semicolons
     chunks = [c for c in re.split(r"[\s;]+", s.strip()) if c]
     out = []
     for i, chunk in enumerate(chunks):
@@ -155,16 +166,19 @@ def parse_waypoints(s):
 class GoThroughPositionsTask:
 
     def __init__(self, waypoints, output_path, timeout,
-                 position_tol, yaw_tol_deg, grace):
-        self.waypoints = waypoints           # list of (x, y, yaw_rad)
-        self.output    = output_path
-        self.timeout   = timeout
-        self.pos_tol   = position_tol
-        self.yaw_tol   = math.radians(yaw_tol_deg)
-        self.grace     = grace
-        self.lock      = threading.Lock()
+                 acceptance_radius, final_tolerance,
+                 yaw_tol_deg, grace, arrival_source, final_pose_check):
+        self.waypoints           = waypoints
+        self.output              = output_path
+        self.timeout             = timeout
+        self.acceptance_radius   = acceptance_radius
+        self.final_tolerance     = final_tolerance
+        self.yaw_tol             = math.radians(yaw_tol_deg)
+        self.grace               = grace
+        self.arrival_source      = arrival_source
+        self.final_pose_check    = final_pose_check  # if True, also gate on yaw at final wp
+        self.lock                = threading.Lock()
 
-        # Latest cached values
         self._odom_filtered = [None] * 6
         self._odom          = [None] * 6
         self._p3d           = [None] * 6
@@ -179,25 +193,12 @@ class GoThroughPositionsTask:
         self._dbg_thr_l     = None
         self._dbg_thr_r     = None
 
-        # Sequence state
-        self._wp_index           = 0       # currently active waypoint
-        self._final_arrived      = False
-        self._final_arrival_time = None
-        # Per-waypoint arrival flag, used to drive advance from cb_p3d
-        self._current_wp_arrived = False
-        # Goal publisher set in run(); needed from cb_p3d to publish next goal
+        self._wp_index           = 0
+        self._trajectory_done    = False
+        self._completion_time    = None
         self._goal_pub           = None
 
-        # Per-segment artifact tracking — written once per waypoint index.
-        self._artifact_seen = {
-            "path":        set(),  # wp_indices we've already written path for
-            "curvatures":  set(),
-            "waypoints":   set(),
-        }
-
-    # -----------------------------------------------------------------------
-    # Time-series callbacks
-    # -----------------------------------------------------------------------
+        self._artifact_seen_waypoints = set()
 
     @staticmethod
     def _unpack_odom(msg):
@@ -207,61 +208,88 @@ class GoThroughPositionsTask:
                 msg.twist.twist.linear.x,
                 msg.twist.twist.linear.y]
 
+    def _radius_for_index(self, idx):
+        """Return the acceptance radius for waypoint idx.
+        Non-final waypoints use the wide acceptance circle (preemptive
+        switch). Final waypoint uses the tight tolerance.
+        """
+        is_final = (idx == len(self.waypoints) - 1)
+        return self.final_tolerance if is_final else self.acceptance_radius
+
+    def _check_arrival(self, unpacked):
+        """Acceptance-circle check. Caller must hold self.lock.
+        Returns the next-goal index to publish (int) or None.
+        """
+        if self._trajectory_done:
+            return None
+
+        idx = self._wp_index
+        if idx >= len(self.waypoints):
+            self._trajectory_done = True
+            self._completion_time = rospy.Time.now()
+            return None
+
+        wx, wy, wyaw = self.waypoints[idx]
+        px, py, _, pyaw, _, _ = unpacked
+        pos_err = math.hypot(px - wx, py - wy)
+
+        radius     = self._radius_for_index(idx)
+        is_final   = (idx == len(self.waypoints) - 1)
+
+        if is_final and self.final_pose_check:
+            yaw_err = abs(_wrap_pi(pyaw - wyaw))
+            arrived = (pos_err < radius) and (yaw_err < self.yaw_tol)
+            err_str = (f"pos_err={pos_err:.2f} m  "
+                       f"yaw_err={math.degrees(yaw_err):.1f} deg  "
+                       f"R={radius:.2f}")
+        else:
+            arrived = (pos_err < radius)
+            err_str = f"pos_err={pos_err:.2f} m  R={radius:.2f}"
+
+        if not arrived:
+            return None
+
+        new_idx = idx + 1
+        self._wp_index = new_idx
+
+        if new_idx >= len(self.waypoints):
+            self._trajectory_done = True
+            self._completion_time = rospy.Time.now()
+            rospy.loginfo(
+                f"[GoThrough] FINAL wp[{idx}] reached  {err_str}  "
+                f"-> trajectory complete, recording {self.grace}s grace")
+            return None
+
+        rospy.loginfo(
+            f"[GoThrough] wp[{idx}] entered acceptance circle  {err_str}  "
+            f"-> preemptive switch to wp[{new_idx}]")
+        return new_idx
+
     def cb_odom_filtered(self, msg):
-        with self.lock: self._odom_filtered = self._unpack_odom(msg)
-
-    def cb_odom(self, msg):
-        with self.lock: self._odom = self._unpack_odom(msg)
-
-    def cb_p3d(self, msg):
-        # p3d drives both pose logging and per-waypoint arrival.
         unpacked = self._unpack_odom(msg)
-        advance_to = None
         publish_goal_for = None
         with self.lock:
-            self._p3d = unpacked
-            if self._final_arrived:
-                # Already done — just keep recording.
-                return
-
-            idx = self._wp_index
-            if idx >= len(self.waypoints):
-                return  # shouldn't happen, defensive
-
-            wx, wy, wyaw = self.waypoints[idx]
-            px, py, _, pyaw, _, _ = unpacked
-            pos_err = math.hypot(px - wx, py - wy)
-            yaw_err = abs(_wrap_pi(pyaw - wyaw))
-
-            is_final = (idx == len(self.waypoints) - 1)
-            if is_final:
-                ok = (pos_err < self.pos_tol) and (yaw_err < self.yaw_tol)
-            else:
-                ok = (pos_err < self.pos_tol)
-
-            if ok and not self._current_wp_arrived:
-                self._current_wp_arrived = True
-                if is_final:
-                    self._final_arrived      = True
-                    self._final_arrival_time = rospy.Time.now()
-                    rospy.loginfo(
-                        f"[GoThrough] FINAL ARRIVED  "
-                        f"pos_err={pos_err:.2f} m  "
-                        f"yaw_err={math.degrees(yaw_err):.1f} deg  "
-                        f"-> recording {self.grace}s grace")
-                else:
-                    rospy.loginfo(
-                        f"[GoThrough] wp[{idx}] reached  "
-                        f"pos_err={pos_err:.2f} m  -> advancing")
-                    advance_to               = idx + 1
-                    publish_goal_for         = idx + 1
-                    self._wp_index           = advance_to
-                    self._current_wp_arrived = False
-
-        # Publish next goal OUTSIDE the lock. ROS publish is generally safe
-        # from any thread but holding the lock across it is unnecessary.
+            self._odom_filtered = unpacked
+            if self.arrival_source == "ekf":
+                publish_goal_for = self._check_arrival(unpacked)
         if publish_goal_for is not None:
             self._publish_goal(publish_goal_for)
+
+    def cb_odom(self, msg):
+        unpacked = self._unpack_odom(msg)
+        publish_goal_for = None
+        with self.lock:
+            self._odom = unpacked
+            if self.arrival_source == "carto":
+                publish_goal_for = self._check_arrival(unpacked)
+        if publish_goal_for is not None:
+            self._publish_goal(publish_goal_for)
+
+    def cb_p3d(self, msg):
+        # Pure logging — Gazebo world frame, NOT used for arrival.
+        unpacked = self._unpack_odom(msg)
+        with self.lock:
+            self._p3d = unpacked
 
     def cb_left_thrust(self, msg):
         with self.lock: self._left_thrust = msg.data
@@ -284,20 +312,12 @@ class GoThroughPositionsTask:
     def cb_dbg_thr_r(self, msg):
         with self.lock: self._dbg_thr_r = msg.data
 
-    # -----------------------------------------------------------------------
-    # Per-segment artifact callbacks. Each one writes a CSV per waypoint
-    # index, so a 3-waypoint run produces _wp0_planned_path.csv,
-    # _wp1_planned_path.csv, _wp2_planned_path.csv.
-    # -----------------------------------------------------------------------
-
     def _current_wp_index(self):
         with self.lock:
             return self._wp_index
 
     def cb_planned_path(self, msg):
         idx = self._current_wp_index()
-        if idx in self._artifact_seen["path"]:
-            return  # already wrote one for this waypoint
         path_csv = f"{_stem(self.output)}_wp{idx}_planned_path.csv"
         try:
             with open(path_csv, "w", newline="") as f:
@@ -314,14 +334,11 @@ class GoThroughPositionsTask:
             rospy.loginfo(
                 f"[GoThrough] wp[{idx}] planned_path: "
                 f"{len(msg.poses)} poses -> {path_csv}")
-            self._artifact_seen["path"].add(idx)
         except Exception as e:
             rospy.logwarn(f"[GoThrough] failed to write planned_path: {e}")
 
     def cb_planned_curvatures(self, msg):
         idx = self._current_wp_index()
-        if idx in self._artifact_seen["curvatures"]:
-            return
         curv_csv = f"{_stem(self.output)}_wp{idx}_planned_curvatures.csv"
         try:
             with open(curv_csv, "w", newline="") as f:
@@ -332,13 +349,12 @@ class GoThroughPositionsTask:
             rospy.loginfo(
                 f"[GoThrough] wp[{idx}] planned_curvatures: "
                 f"{len(msg.data)} samples -> {curv_csv}")
-            self._artifact_seen["curvatures"].add(idx)
         except Exception as e:
             rospy.logwarn(f"[GoThrough] failed to write planned_curvatures: {e}")
 
     def cb_waypoints(self, msg):
         idx = self._current_wp_index()
-        if idx in self._artifact_seen["waypoints"]:
+        if idx in self._artifact_seen_waypoints:
             return
         wp_csv = f"{_stem(self.output)}_wp{idx}_waypoints.csv"
         try:
@@ -355,16 +371,14 @@ class GoThroughPositionsTask:
             rospy.loginfo(
                 f"[GoThrough] wp[{idx}] waypoints: "
                 f"{len(msg.poses)} poses -> {wp_csv}")
-            self._artifact_seen["waypoints"].add(idx)
+            self._artifact_seen_waypoints.add(idx)
         except Exception as e:
             rospy.logwarn(f"[GoThrough] failed to write waypoints: {e}")
 
-    # -----------------------------------------------------------------------
-    # Timer callback
-    # -----------------------------------------------------------------------
-
     def _write_row(self, event):
         with self.lock:
+            current_radius = self._radius_for_index(
+                min(self._wp_index, len(self.waypoints) - 1))
             row = (
                 [time.time(), rospy.Time.now().to_sec()]
                 + list(self._odom_filtered)
@@ -375,18 +389,13 @@ class GoThroughPositionsTask:
                 + [self._dbg_speed_act, self._dbg_speed_des,
                    self._dbg_yaw_act,   self._dbg_yaw_des,
                    self._dbg_thr_l,     self._dbg_thr_r]
-                + [self._wp_index, 1 if self._final_arrived else 0]
+                + [self._wp_index, current_radius,
+                   1 if self._trajectory_done else 0]
             )
         self._writer.writerow(row)
 
-    # -----------------------------------------------------------------------
-    # Goal publishing
-    # -----------------------------------------------------------------------
-
     def _publish_goal(self, idx):
-        if self._goal_pub is None:
-            return
-        if idx >= len(self.waypoints):
+        if self._goal_pub is None or idx >= len(self.waypoints):
             return
         x, y, yaw_rad = self.waypoints[idx]
         goal = PoseStamped()
@@ -402,11 +411,11 @@ class GoThroughPositionsTask:
         goal.pose.orientation.w = q[3]
         self._goal_pub.publish(goal)
         is_final = (idx == len(self.waypoints) - 1)
+        radius = self._radius_for_index(idx)
         rospy.loginfo(
             f"[GoThrough] goal[{idx}{'/final' if is_final else ''}] "
-            f"-> x={x}  y={y}  yaw={math.degrees(yaw_rad):.1f} deg")
-
-    # -----------------------------------------------------------------------
+            f"-> x={x}  y={y}  yaw={math.degrees(yaw_rad):.1f} deg  "
+            f"R={radius:.2f}")
 
     def run(self):
         rospy.init_node("go_through_positions_task", anonymous=True)
@@ -432,28 +441,35 @@ class GoThroughPositionsTask:
         self._csvfile = open(self.output, "w", newline="")
         self._writer  = csv.writer(self._csvfile)
         self._writer.writerow(CSV_HEADER)
-        rospy.loginfo(f"[GoThrough] Recording -> {self.output}  @ {RECORD_HZ} Hz")
+        rospy.loginfo(
+            f"[GoThrough] Recording -> {self.output}  @ {RECORD_HZ} Hz  "
+            f"(acceptance-circle switching)")
 
         self._goal_pub = rospy.Publisher(TOPIC_GOAL, PoseStamped,
                                          queue_size=1, latch=True)
         rospy.sleep(1.0)
 
-        rospy.loginfo(f"[GoThrough] {len(self.waypoints)} waypoints:")
+        n = len(self.waypoints)
+        rospy.loginfo(f"[GoThrough] {n} waypoints (acceptance-circle scheme):")
         for i, (x, y, yaw_rad) in enumerate(self.waypoints):
-            tag = " (FINAL)" if i == len(self.waypoints) - 1 else ""
+            r = self._radius_for_index(i)
+            tag = " (FINAL — tight tolerance)" if i == n - 1 else " (preemptive switch)"
             rospy.loginfo(
-                f"  [{i}] x={x}  y={y}  yaw={math.degrees(yaw_rad):.1f} deg{tag}")
+                f"  [{i}] x={x}  y={y}  yaw={math.degrees(yaw_rad):.1f} deg  "
+                f"R={r:.2f} m{tag}")
+
         rospy.loginfo(
-            f"[GoThrough] Tolerances: pos<{self.pos_tol} m, "
-            f"yaw<{math.degrees(self.yaw_tol):.1f} deg (final only), "
-            f"grace={self.grace}s, hard timeout={self.timeout}s")
+            f"[GoThrough] arrival rule: pos_err < acceptance_radius "
+            f"(non-final R={self.acceptance_radius:.2f} m, "
+            f"final R={self.final_tolerance:.2f} m"
+            f"{', + yaw check' if self.final_pose_check else ''})  "
+            f"source={self.arrival_source}")
+        rospy.loginfo(
+            f"[GoThrough] grace={self.grace}s, hard timeout={self.timeout}s")
 
-        # Publish first goal
         self._publish_goal(0)
-
         rospy.Timer(rospy.Duration(1.0 / RECORD_HZ), self._write_row)
 
-        # Main loop with hard cap and post-final grace.
         start = rospy.Time.now()
         rate = rospy.Rate(20.0)
         while not rospy.is_shutdown():
@@ -462,22 +478,22 @@ class GoThroughPositionsTask:
 
             if elapsed >= self.timeout:
                 with self.lock:
-                    final = self._final_arrived
-                    idx = self._wp_index
-                if final:
+                    done = self._trajectory_done
+                    idx  = self._wp_index
+                if done:
                     rospy.loginfo("[GoThrough] hard timeout reached during grace")
                 else:
                     rospy.logwarn(
                         f"[GoThrough] hard timeout reached at wp[{idx}]/"
-                        f"{len(self.waypoints)} (no final arrival)")
+                        f"{len(self.waypoints)} (trajectory not complete)")
                 break
 
             with self.lock:
-                final     = self._final_arrived
-                arrival_t = self._final_arrival_time
+                done       = self._trajectory_done
+                completion = self._completion_time
 
-            if final and arrival_t is not None:
-                if (now - arrival_t).to_sec() >= self.grace:
+            if done and completion is not None:
+                if (now - completion).to_sec() >= self.grace:
                     rospy.loginfo(f"[GoThrough] grace window complete (t={elapsed:.1f}s)")
                     break
 
@@ -493,19 +509,42 @@ class GoThroughPositionsTask:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description=("Drive through a sequence of waypoints. "
-                     "Intermediates: position-only arrival. Final: position+yaw."),
+        description="Drive through waypoints with acceptance-circle "
+                    "switching (Fossen / Lekkas-style).",
     )
     parser.add_argument("--waypoints", type=str, default=DEFAULT_WAYPOINTS,
                         help="space- or semicolon-separated 'x,y,yaw_deg' tuples")
-    parser.add_argument("--output",    type=str,   default=DEFAULT_OUTPUT)
-    parser.add_argument("--timeout",   type=float, default=TIMEOUT,
+    parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT)
+    parser.add_argument("--timeout", type=float, default=TIMEOUT,
                         help="hard cap for whole sequence, seconds")
-    parser.add_argument("--pos-tol",   type=float, default=POSITION_TOL_M, help="meters")
-    parser.add_argument("--yaw-tol",   type=float, default=YAW_TOL_DEG,
-                        help="degrees, applied at FINAL waypoint only")
-    parser.add_argument("--grace",     type=float, default=GRACE_AFTER_ARRIVAL,
-                        help="seconds to record after final arrival")
+    parser.add_argument("--acceptance-radius", type=float,
+                        default=ACCEPTANCE_RADIUS_M,
+                        help="acceptance circle radius for NON-FINAL "
+                             "waypoints, meters. Literature recommends "
+                             "1-3x the boat's minimum turning radius. "
+                             "Larger = smoother, more corner-cut. "
+                             "Smaller = tighter cornering, sharper turns.")
+    parser.add_argument("--final-tolerance", type=float,
+                        default=FINAL_TOLERANCE_M,
+                        help="position tolerance at the FINAL waypoint, "
+                             "meters. This is where the boat actually "
+                             "stops, so use the tightest value the boat "
+                             "can reliably achieve given its momentum.")
+    parser.add_argument("--final-pose", action="store_true",
+                        help="also require yaw alignment at the final "
+                             "waypoint (Lekkas/Fossen 'GoThroughPoses' "
+                             "variant). Non-final waypoints are still "
+                             "position-only.")
+    parser.add_argument("--yaw-tol", type=float, default=YAW_TOL_DEG,
+                        help="yaw tolerance at final waypoint, degrees "
+                             "(only used with --final-pose)")
+    parser.add_argument("--grace", type=float, default=GRACE_AFTER_ARRIVAL,
+                        help="seconds to record after trajectory completes")
+    parser.add_argument("--arrival-source", choices=["ekf", "carto"],
+                        default="ekf",
+                        help="which localizer drives the arrival check. "
+                             "ekf=/odometry/filtered, carto=/odom. p3d "
+                             "is logged but not used for arrival.")
     args = parser.parse_args()
 
     try:
@@ -517,7 +556,9 @@ if __name__ == "__main__":
     try:
         task = GoThroughPositionsTask(
             wps, args.output, args.timeout,
-            args.pos_tol, args.yaw_tol, args.grace)
+            args.acceptance_radius, args.final_tolerance,
+            args.yaw_tol, args.grace,
+            args.arrival_source, args.final_pose)
         task.run()
     except rospy.ROSInterruptException:
         pass
